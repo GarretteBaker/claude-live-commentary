@@ -35,6 +35,7 @@ BYTES_PER_SEC = SAMPLE_RATE * 2  # s16le mono
 COMMENTATOR_SYSTEM = """\
 You are a silent commentator observing a live intellectual discussion or lecture.
 You see a rolling speech-recognition transcript; it contains transcription errors — read through them and never comment on transcription quality.
+Lines carry heuristic speaker labels: LECTURER is the speaker with the most airtime, AUDIENCE-n are others. Labels can be wrong, especially early on or for short remarks — treat them as hints, useful for telling audience questions apart from the main thread.
 
 Your output may be projected on a screen in the room, so speak rarely.
 Each time you see the transcript, reply with either the single token PASS or one comment.
@@ -148,7 +149,7 @@ class Transcript:
 
     def text(self) -> str:
         with self._lock:
-            return " ".join(self._segments)
+            return "\n".join(self._segments)
 
     def word_count(self) -> int:
         return len(self.text().split())
@@ -186,6 +187,58 @@ comments: list[str] = []
 meta = {"youtube_id": None, "speed": 1.0, "started_at": None}
 
 
+# ---------------------------------------------------------------- speakers
+
+class SpeakerLabeler:
+    """Greedy online clustering of ECAPA speaker embeddings. The cluster with
+    the most accumulated speech duration is the LECTURER; everyone else is
+    AUDIENCE-n. No enrollment needed - label semantics come from airtime."""
+
+    SIM_THRESHOLD = 0.45   # cosine; far-field audio compresses the margin
+    MIN_SEC = 0.8          # segments shorter than this inherit the last label
+
+    def __init__(self):
+        import torch
+        from speechbrain.inference.speaker import EncoderClassifier
+        self._torch = torch
+        # CPU on purpose: torch's bundled cudnn clashes with the cudnn we put
+        # on LD_LIBRARY_PATH for ctranslate2, and CPU is ~ms per segment anyway
+        self._enc = EncoderClassifier.from_hparams(
+            "speechbrain/spkrec-ecapa-voxceleb", run_opts={"device": "cpu"},
+        )
+        self._centroids: list[np.ndarray] = []   # unit vectors
+        self._durations: list[float] = []        # accumulated speech per cluster
+        self._last = "LECTURER"
+
+    def label(self, audio: np.ndarray, start: float, end: float) -> str:
+        dur = end - start
+        if dur < self.MIN_SEC:
+            return self._last
+        seg = audio[int(start * SAMPLE_RATE):int(end * SAMPLE_RATE)]
+        with self._torch.no_grad():
+            emb = self._enc.encode_batch(self._torch.from_numpy(seg)[None])
+        v = emb.squeeze().cpu().numpy()
+        v = v / np.linalg.norm(v)
+
+        if self._centroids:
+            sims = [float(v @ c) for c in self._centroids]
+            best = int(np.argmax(sims))
+        if not self._centroids or sims[best] < self.SIM_THRESHOLD:
+            self._centroids.append(v)
+            self._durations.append(dur)
+            best = len(self._centroids) - 1
+        else:
+            # EMA keeps the centroid tracking slow drift (position, loudness)
+            c = 0.9 * self._centroids[best] + 0.1 * v
+            self._centroids[best] = c / np.linalg.norm(c)
+            self._durations[best] += dur
+
+        lecturer = int(np.argmax(self._durations))
+        self._last = ("LECTURER" if best == lecturer
+                      else f"AUDIENCE-{best if best < lecturer else best - 1}")
+        return self._last
+
+
 # ---------------------------------------------------------------- transcription
 
 def transcriber_thread(audio_q: queue.Queue, args):
@@ -194,11 +247,16 @@ def transcriber_thread(audio_q: queue.Queue, args):
     print(f"[whisper] loading {args.whisper_model} on {args.device} …")
     model = WhisperModel(args.whisper_model, device=args.device,
                          compute_type="int8" if args.device == "cpu" else "float16")
+    labeler = None
+    if not args.no_speakers:
+        print("[speakers] loading ECAPA embedder …")
+        labeler = SpeakerLabeler()
     print("[whisper] ready")
     broadcaster.publish({"type": "status", "text": "listening"})
 
     buf = bytearray()
     chunk_bytes = int(BYTES_PER_SEC * args.chunk_sec)
+    prev_plain = ""  # label-free tail for whisper's initial_prompt
     while True:
         buf.extend(audio_q.get())
         if len(buf) < chunk_bytes:
@@ -209,19 +267,30 @@ def transcriber_thread(audio_q: queue.Queue, args):
         if np.sqrt(np.mean(audio**2)) < 0.0015:  # silence gate
             continue
 
-        tail = transcript.text()[-200:]
         t0 = time.monotonic()
         segments, _info = model.transcribe(
             audio, language=args.language, vad_filter=True,
-            initial_prompt=tail if tail else None, beam_size=1,
+            initial_prompt=prev_plain[-200:] or None, beam_size=1,
         )
-        new = " ".join(s.text.strip() for s in segments).strip()
+        lines: list[tuple[str, str]] = []  # (speaker label, text)
+        for s in segments:
+            text = s.text.strip()
+            if not text:
+                continue
+            who = labeler.label(audio, s.start, s.end) if labeler else ""
+            if lines and lines[-1][0] == who:
+                lines[-1] = (who, lines[-1][1] + " " + text)
+            else:
+                lines.append((who, text))
         dt = time.monotonic() - t0
-        if not new:
+        if not lines:
             continue
-        transcript.append(new)
-        print(f"[asr] ({dt:.2f}s) {new}")
-        broadcaster.publish({"type": "transcript", "text": new})
+        prev_plain = " ".join(text for _who, text in lines)
+        for who, text in lines:
+            line = f"{who}: {text}" if who else text
+            transcript.append(line)
+            print(f"[asr] ({dt:.2f}s) {line}")
+            broadcaster.publish({"type": "transcript", "text": line})
 
 
 # ---------------------------------------------------------------- commentary
@@ -395,6 +464,8 @@ def main():
                    help="faster-whisper model; small.en is a lighter fallback")
     p.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     p.add_argument("--language", default="en")
+    p.add_argument("--no-speakers", action="store_true",
+                   help="disable speaker labeling (skips the ECAPA model)")
     p.add_argument("--chunk-sec", type=float, default=7.0, help="transcription chunk length")
     p.add_argument("--claude-model", default="claude-opus-5")
     p.add_argument("--effort", default="medium", choices=["low", "medium", "high"])
