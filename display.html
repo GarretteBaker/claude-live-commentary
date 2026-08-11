@@ -24,9 +24,21 @@
     100% { text-shadow: 0 0 0 rgba(232,230,224,0); }
   }
   #current.pulse { animation: pulse 2.2s ease-out 1; }
+  #top { flex: 1; display: flex; min-height: 0; }
+  #videobox {
+    flex: 1.1; display: flex; flex-direction: column; justify-content: center;
+    padding: 3vh 0 3vh 3vw; position: relative;
+  }
+  #videobox[hidden] { display: none; }
+  #player { width: 100%; aspect-ratio: 16 / 9; border: 1px solid #1c2028; }
+  #starthint {
+    position: absolute; inset: 0; display: flex; align-items: center;
+    justify-content: center; font: 1rem system-ui, sans-serif; color: #8a92a2;
+    background: rgba(12,14,18,0.6); cursor: pointer;
+  }
   #main {
     flex: 1; display: flex; flex-direction: column; justify-content: center;
-    padding: 4vh 8vw; min-height: 0;
+    padding: 4vh 6vw; min-height: 0;
   }
   #current {
     font-size: clamp(1.6rem, 4.2vw, 3.4rem); line-height: 1.35;
@@ -53,7 +65,13 @@
 </head>
 <body>
   <div id="status">connecting…</div>
-  <div id="main"><div id="current"></div></div>
+  <div id="top">
+    <div id="videobox" hidden>
+      <div id="player"></div>
+      <div id="starthint">click to start the video in sync with the feed</div>
+    </div>
+    <div id="main"><div id="current"></div></div>
+  </div>
   <div id="history"></div>
   <div id="ticker"></div>
 <script>
@@ -112,6 +130,39 @@
   document.addEventListener("click", () => {
     if (chimeOn && !audioCtx) audioCtx = new AudioContext();
   }, { once: true });
+  // Video pane: in YouTube mode, embed the video seeked to wherever the
+  // audio feed currently is, playing at the same speed. YouTube caps
+  // playbackRate at 2x; above that the periodic resync jump-cuts forward.
+  fetch("/meta").then(r => r.json()).then(meta => {
+    if (!meta.youtube_id) return;
+    document.getElementById("videobox").hidden = false;
+    const tag = document.createElement("script");
+    tag.src = "https://www.youtube.com/iframe_api";
+    document.head.append(tag);
+    window.onYouTubeIframeAPIReady = () => {
+      const player = new YT.Player("player", {
+        videoId: meta.youtube_id,
+        playerVars: { controls: 1, rel: 0 },
+        events: {
+          onReady: () => {
+            const feedPos = () => (Date.now() / 1000 - meta.started_at) * meta.speed;
+            const sync = () => {
+              player.setPlaybackRate(meta.speed);
+              if (Math.abs(player.getCurrentTime() - feedPos()) > 2.5)
+                player.seekTo(feedPos(), true);
+            };
+            const hint = document.getElementById("starthint");
+            hint.addEventListener("click", () => {
+              hint.remove();
+              sync(); player.playVideo();
+              setInterval(sync, 10000);
+            }, { once: true });
+          },
+        },
+      });
+    };
+  });
+
   function chime() {
     if (!audioCtx) return;
     const t = audioCtx.currentTime;

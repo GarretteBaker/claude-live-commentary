@@ -17,6 +17,7 @@ import os
 import sys
 import json
 import queue
+import re
 import subprocess
 import threading
 import time
@@ -180,6 +181,9 @@ class Broadcaster:
 transcript = Transcript()
 broadcaster = Broadcaster()
 comments: list[str] = []
+# populated at startup when the source is a YouTube URL, so the display
+# page can embed the video synced to the audio feed
+meta = {"youtube_id": None, "speed": 1.0, "started_at": None}
 
 
 # ---------------------------------------------------------------- transcription
@@ -303,6 +307,10 @@ def make_app(args) -> FastAPI:
         audio_q: queue.Queue = queue.Queue()
         if args.wav:
             blocks = file_pcm_blocks(args.wav, args.speed, 0.5)
+            yt = re.search(r"(?:v=|youtu\.be/|/shorts/|/live/)([\w-]{11})", args.wav)
+            if yt:
+                meta.update(youtube_id=yt.group(1), speed=args.speed,
+                            started_at=time.time())
         else:
             blocks = mic_pcm_blocks(0.5)
 
@@ -330,6 +338,10 @@ def make_app(args) -> FastAPI:
     @app.get("/")
     async def index():
         return FileResponse(Path(__file__).parent / "display.html")
+
+    @app.get("/meta")
+    async def get_meta():
+        return meta
 
     @app.get("/events")
     async def events():
