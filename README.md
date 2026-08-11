@@ -50,6 +50,17 @@ The commentator system prompt is `COMMENTATOR_SYSTEM` at the top of `app.py`
 Cost: each opportunity is one small Opus call (~1–3k tokens in, ~50 out), about
 1–2¢. A 2-hour session at default cadence ≈ $2–5.
 
+## TODO
+
+- **Speaker detection (diarization)**: attribute transcript lines to speakers
+  (e.g. pyannote or whisperX on the same GPU) so the commentator can say "A's
+  objection concedes B's earlier premise" — the connect-two-remarks
+  interventions are weak without it.
+- **Subject context**: give the model the material ahead of time — curriculum,
+  lecture notes, session abstract — as a cached system-prompt block (e.g.
+  `--context notes.md`), so comments can reference definitions and results the
+  room has already seen rather than reconstructing them from the transcript.
+
 ## Known limitations (MVP)
 
 - Chunked transcription, no streaming ASR: words at chunk boundaries can be
