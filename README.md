@@ -22,6 +22,9 @@ uv run app.py                         # live mic (ANTHROPIC_API_KEY from your sh
 uv run app.py --chatty                # lower the commentary bar (demos, testing)
 uv run app.py --wav lecture.mp3       # demo against a recording (any av format)
 uv run app.py --wav "https://www.youtube.com/watch?v=..."  # YouTube, as if live
+# in YouTube mode the display page embeds the video next to the commentary,
+# click-to-start, seeked to the feed position and playing at --speed
+# (YouTube caps playback at 2x; above that it resyncs by jumping forward)
 uv run app.py --wav talk.mp3 --speed 4 --comment-interval 8   # fast replay
 uv run app.py --mock                  # no API key, canned comments
 ```
