@@ -5,6 +5,7 @@ Pipeline: audio (mic or file) -> faster-whisper rolling transcription
 
 Run:  uv run app.py                     # live mic (parecord / PipeWire)
       uv run app.py --wav lecture.mp3   # simulate from a recording
+      uv run app.py --wav "https://www.youtube.com/watch?v=..."   # as if live
       uv run app.py --mock              # no API key needed, canned comments
 Then project http://localhost:8710 on the screen.
 """
@@ -104,13 +105,21 @@ def mic_pcm_blocks(block_sec: float):
         yield data
 
 
-def file_pcm_blocks(path: str, speed: float, block_sec: float):
-    """Decode any audio/video file to PCM and pace it like a live feed."""
-    proc = subprocess.Popen(
-        ["ffmpeg", "-loglevel", "error", "-i", path,
-         "-f", "s16le", "-ar", str(SAMPLE_RATE), "-ac", "1", "-"],
-        stdout=subprocess.PIPE,
-    )
+def file_pcm_blocks(source: str, speed: float, block_sec: float):
+    """Decode a local file — or, via yt-dlp, a YouTube/etc. URL — to PCM and
+    pace it like a live feed."""
+    ffmpeg_cmd = ["ffmpeg", "-loglevel", "error", "-i", "pipe:0",
+                  "-f", "s16le", "-ar", str(SAMPLE_RATE), "-ac", "1", "-"]
+    if source.startswith(("http://", "https://")):
+        fetcher = subprocess.Popen(
+            [sys.executable, "-m", "yt_dlp", "-q", "-f", "bestaudio", "-o", "-", source],
+            stdout=subprocess.PIPE,
+        )
+        proc = subprocess.Popen(ffmpeg_cmd, stdin=fetcher.stdout,
+                                stdout=subprocess.PIPE)
+    else:
+        proc = subprocess.Popen(ffmpeg_cmd[:4] + [source] + ffmpeg_cmd[5:],
+                                stdout=subprocess.PIPE)
     n = int(BYTES_PER_SEC * block_sec)
     while True:
         t0 = time.monotonic()
@@ -342,7 +351,8 @@ def make_app(args) -> FastAPI:
 def main():
     sys.stdout.reconfigure(line_buffering=True)  # logs stay live when piped to a file
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--wav", help="audio/video file to simulate a live feed from (mic if omitted)")
+    p.add_argument("--wav", "--input", dest="wav", metavar="FILE_OR_URL",
+                   help="audio/video file or YouTube/etc. URL to simulate a live feed from (mic if omitted)")
     p.add_argument("--speed", type=float, default=1.0, help="playback speed for --wav")
     p.add_argument("--mock", action="store_true", help="canned comments instead of the Claude API")
     p.add_argument("--whisper-model", default="distil-large-v3",

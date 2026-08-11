@@ -21,6 +21,7 @@ Claude reply including PASSes with reasons, so you can see why it stays silent.
 uv run app.py                         # live mic (ANTHROPIC_API_KEY from your shell)
 uv run app.py --chatty                # lower the commentary bar (demos, testing)
 uv run app.py --wav lecture.mp3       # demo against a recording (any av format)
+uv run app.py --wav "https://www.youtube.com/watch?v=..."  # YouTube, as if live
 uv run app.py --wav talk.mp3 --speed 4 --comment-interval 8   # fast replay
 uv run app.py --mock                  # no API key, canned comments
 ```
@@ -56,11 +57,6 @@ Cost: each opportunity is one small Opus call (~1–3k tokens in, ~50 out), abou
   (e.g. pyannote or whisperX on the same GPU) so the commentator can say "A's
   objection concedes B's earlier premise" — the connect-two-remarks
   interventions are weak without it.
-- **Subject context**: give the model the material ahead of time — curriculum,
-  lecture notes, session abstract — as a cached system-prompt block (e.g.
-  `--context notes.md`), so comments can reference definitions and results the
-  room has already seen rather than reconstructing them from the transcript.
-
 ## Known limitations (MVP)
 
 - Chunked transcription, no streaming ASR: words at chunk boundaries can be
