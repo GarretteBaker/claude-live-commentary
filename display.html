@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Live Commentary</title>
+<style>
+  :root { color-scheme: dark; }
+  * { margin: 0; box-sizing: border-box; }
+  body {
+    background: #0c0e12; color: #e8e6e0;
+    font-family: Georgia, "Iowan Old Style", serif;
+    height: 100vh; display: flex; flex-direction: column; overflow: hidden;
+  }
+  #status {
+    position: fixed; top: 1rem; right: 1.4rem;
+    font: 0.8rem/1 system-ui, sans-serif; color: #4a5262; letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+  #status.live { color: #6faf7a; }
+  #status.crashed { color: #c05a5a; }
+  @keyframes pulse {
+    0%   { text-shadow: 0 0 0 rgba(232,230,224,0); }
+    25%  { text-shadow: 0 0 34px rgba(232,230,224,0.55); }
+    100% { text-shadow: 0 0 0 rgba(232,230,224,0); }
+  }
+  #current.pulse { animation: pulse 2.2s ease-out 1; }
+  #main {
+    flex: 1; display: flex; flex-direction: column; justify-content: center;
+    padding: 4vh 8vw; min-height: 0;
+  }
+  #current {
+    font-size: clamp(1.6rem, 4.2vw, 3.4rem); line-height: 1.35;
+    font-style: italic; opacity: 0; transition: opacity 1.2s ease;
+  }
+  #current.shown { opacity: 1; }
+  #current .ts {
+    display: block; margin-top: 1.2rem;
+    font: 0.85rem/1 system-ui, sans-serif; font-style: normal; color: #4a5262;
+  }
+  #history {
+    padding: 0 8vw 2vh; max-height: 28vh; overflow: hidden;
+    display: flex; flex-direction: column-reverse; gap: 0.6rem;
+  }
+  #history div {
+    font-size: clamp(0.85rem, 1.5vw, 1.15rem); color: #6a7180; line-height: 1.35;
+  }
+  #ticker {
+    border-top: 1px solid #1c2028; padding: 0.9rem 2vw 1.1rem;
+    font: clamp(0.75rem, 1.3vw, 1rem)/1.4 system-ui, sans-serif;
+    color: #3d4452; white-space: nowrap; overflow: hidden; text-align: right;
+  }
+</style>
+</head>
+<body>
+  <div id="status">connecting…</div>
+  <div id="main"><div id="current"></div></div>
+  <div id="history"></div>
+  <div id="ticker"></div>
+<script>
+  const current = document.getElementById("current");
+  const history = document.getElementById("history");
+  const ticker  = document.getElementById("ticker");
+  const status  = document.getElementById("status");
+  let tickerText = "";
+
+  const es = new EventSource("/events");
+  es.onopen  = () => { status.textContent = "live"; status.classList.add("live"); };
+  es.onerror = () => { status.textContent = "reconnecting…"; status.classList.remove("live"); };
+
+  es.onmessage = (m) => {
+    const ev = JSON.parse(m.data);
+    if (ev.type === "transcript") {
+      tickerText = (tickerText + " " + ev.text).slice(-300);
+      ticker.textContent = tickerText;
+    } else if (ev.type === "comment") {
+      const hadPrevious = current.textContent.trim().length > 0;
+      if (hadPrevious) {
+        const d = document.createElement("div");
+        d.textContent = current.firstChild ? current.firstChild.textContent : "";
+        history.prepend(d);
+        while (history.childElementCount > 6) history.lastChild.remove();
+      }
+      const show = () => {
+        current.innerHTML = "";
+        current.append(document.createTextNode(ev.text));
+        const ts = document.createElement("span");
+        ts.className = "ts"; ts.textContent = ev.ts || "";
+        current.append(ts);
+        current.classList.add("shown");
+        current.classList.remove("pulse");
+        void current.offsetWidth;  // restart the animation
+        current.classList.add("pulse");
+        if (ev.ts) chime();  // replayed history has no timestamp -> silent
+      };
+      if (hadPrevious) {
+        current.classList.remove("shown");
+        setTimeout(show, 250);
+      } else {
+        show();
+      }
+    } else if (ev.type === "status") {
+      status.textContent = ev.text;
+      status.classList.toggle("crashed", ev.text.includes("crashed"));
+      status.classList.toggle("live", !ev.text.includes("crashed"));
+    }
+  };
+
+  // Opt-in chime: open the page as /?chime (browsers require a click first
+  // to unlock audio, so click anywhere on the page once after loading).
+  const chimeOn = new URLSearchParams(location.search).has("chime");
+  let audioCtx = null;
+  document.addEventListener("click", () => {
+    if (chimeOn && !audioCtx) audioCtx = new AudioContext();
+  }, { once: true });
+  function chime() {
+    if (!audioCtx) return;
+    const t = audioCtx.currentTime;
+    [523.25, 783.99].forEach((freq, i) => {
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.frequency.value = freq;
+      gain.gain.setValueAtTime(0, t + i * 0.12);
+      gain.gain.linearRampToValueAtTime(0.08, t + i * 0.12 + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.001, t + i * 0.12 + 0.7);
+      osc.connect(gain).connect(audioCtx.destination);
+      osc.start(t + i * 0.12); osc.stop(t + i * 0.12 + 0.8);
+    });
+  }
+</script>
+</body>
+</html>
