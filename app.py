@@ -262,7 +262,7 @@ def commentator_thread(args):
         client = None
     else:
         import anthropic
-        client = anthropic.Anthropic()
+        client = anthropic.Anthropic(max_retries=4)  # ride out short network blips
 
     seen_words = 0
     last_fire = time.monotonic()
@@ -319,18 +319,42 @@ def make_app(args) -> FastAPI:
                 audio_q.put(b)
             print("[audio] stream ended")
 
+        targets = {
+            "audio": reader,
+            "transcriber": lambda: transcriber_thread(audio_q, args),
+            "commentator": lambda: commentator_thread(args),
+        }
+
+        def spawn(name: str):
+            threading.Thread(target=targets[name], name=name, daemon=True).start()
+
         def on_thread_crash(exc):
             print(f"\n[FATAL] {exc.thread.name} thread crashed:", flush=True)
             import traceback
             traceback.print_exception(exc.exc_type, exc.exc_value, exc.exc_traceback)
-            broadcaster.publish({"type": "status",
-                                 "text": f"{exc.thread.name} crashed — see terminal"})
+            # A transient network/API failure shouldn't end commentary for the
+            # whole session: relaunch the commentator. Anything else (bad key,
+            # 4xx, bugs) stays dead and visible.
+            import anthropic
+            transient = (anthropic.APIConnectionError, anthropic.RateLimitError,
+                         anthropic.InternalServerError)
+            if exc.thread.name == "commentator" and issubclass(exc.exc_type, transient):
+                print("[commentator] transient failure — restarting in 15s", flush=True)
+                broadcaster.publish({"type": "status", "text": "reconnecting to Claude…"})
+
+                def relaunch():
+                    time.sleep(15)
+                    broadcaster.publish({"type": "status", "text": "live"})
+                    spawn("commentator")
+
+                threading.Thread(target=relaunch, name="relauncher", daemon=True).start()
+            else:
+                broadcaster.publish({"type": "status",
+                                     "text": f"{exc.thread.name} crashed — see terminal"})
 
         threading.excepthook = on_thread_crash
-        for name, target in (("audio", reader),
-                             ("transcriber", lambda: transcriber_thread(audio_q, args)),
-                             ("commentator", lambda: commentator_thread(args))):
-            threading.Thread(target=target, name=name, daemon=True).start()
+        for name in targets:
+            spawn(name)
         yield
 
     app = FastAPI(lifespan=lifespan)
