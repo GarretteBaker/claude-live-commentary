@@ -27,7 +27,7 @@ from pathlib import Path
 import numpy as np
 import uvicorn
 from fastapi import FastAPI
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 
 SAMPLE_RATE = 16000
 BYTES_PER_SEC = SAMPLE_RATE * 2  # s16le mono
@@ -223,9 +223,19 @@ comments: list[dict] = []  # {"id", "text", "ts", "context"}
 # right before a Claude call, so the prompt includes the freshest words
 flush_req = threading.Event()
 flush_done = threading.Event()
-# populated at startup when the source is a YouTube URL, so the display
-# page can embed the video synced to the audio feed
-meta = {"youtube_id": None, "speed": 1.0, "started_at": None}
+# populated at startup: youtube_* lets the display page embed the video
+# synced to the audio feed; url is the LAN address phones should open
+meta = {"youtube_id": None, "speed": 1.0, "started_at": None, "url": None}
+
+
+def lan_ip() -> str:
+    """The address other devices on the network reach this machine at."""
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.connect(("8.8.8.8", 80))  # routing lookup only; no packets sent
+    ip = s.getsockname()[0]
+    s.close()
+    return ip
 
 
 # ---------------------------------------------------------------- speakers
@@ -552,6 +562,16 @@ def make_app(args) -> FastAPI:
     async def get_meta():
         return meta
 
+    @app.get("/qr.svg")
+    async def qr_svg():
+        import io
+        import qrcode
+        import qrcode.image.svg
+        img = qrcode.make(meta["url"], image_factory=qrcode.image.svg.SvgPathImage)
+        buf = io.BytesIO()
+        img.save(buf)
+        return Response(buf.getvalue(), media_type="image/svg+xml")
+
     @app.get("/config")
     async def get_config():
         return {"chattiness": config["chattiness"]}
@@ -629,8 +649,10 @@ def main():
         print(f"[app] context:  {args.context} ({len(config['context'])} chars)")
 
     session_log.start(args)
+    meta["url"] = f"http://{lan_ip()}:{args.port}"
     print(f"[app] project:  {Path(__file__).resolve().parent}")
     print(f"[app] display:  http://localhost:{args.port}  (project this)")
+    print(f"[app] phones:   {meta['url']}  (QR in the corner of the display)")
     print(f"[app] whisper:  {args.whisper_model} on {args.device}")
     print(f"[app] log:      {session_log.path}")
     uvicorn.run(make_app(args), host="0.0.0.0", port=args.port, log_level="warning")

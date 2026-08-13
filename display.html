@@ -97,6 +97,30 @@
   #ops-chat button.picked { border-color: #c9a45a; color: #e8e6e0; }
   #ops-passes div { margin-bottom: 0.35rem; }
   #ops-passes .t { color: #4a5262; }
+  /* --- QR corner: phones in the room scan to follow along --- */
+  #qr {
+    position: fixed; left: 1.2rem; bottom: 3.4rem; z-index: 1;
+    text-align: center; font: 0.65rem/1.5 system-ui, sans-serif; color: #4a5262;
+  }
+  #qr img { width: 96px; height: 96px; background: #fff; padding: 5px;
+            border-radius: 4px; display: block; margin: 0 auto 0.25rem; }
+  #qr[hidden] { display: none; }
+  body.qr #history { padding-left: calc(96px + 3rem); }
+  /* --- phone layout: scrollable feed instead of a fixed projection --- */
+  @media (max-width: 700px) {
+    body { height: auto; min-height: 100dvh; overflow-y: auto; }
+    #top { flex-direction: column; flex: none; }
+    #videobox, #qr { display: none; }
+    #main { padding: 4.5rem 7vw 2rem; justify-content: flex-start; flex: none; }
+    #current { font-size: 1.5rem; }
+    #history { max-height: none; overflow: visible; padding-bottom: 3.4rem; }
+    #history div.item { font-size: 1.05rem; }
+    #ticker { position: fixed; bottom: 0; left: 0; right: 0;
+              background: #0c0e12; text-align: left; }
+    #ops { position: static; width: auto; border-left: none;
+           border-top: 1px solid #1c2028; padding-top: 1rem; }
+    body.ops #top, body.ops #history, body.ops #ticker { margin-right: 0; }
+  }
 </style>
 </head>
 <body>
@@ -110,6 +134,7 @@
   </div>
   <div id="history"></div>
   <div id="ticker"></div>
+  <div id="qr" hidden><img src="/qr.svg" alt=""><span id="qr-url"></span></div>
   <div id="ops" hidden>
     <div class="h">pipeline</div>
     <div id="ops-stage">stage: connecting…</div>
@@ -175,13 +200,16 @@
     return span;
   }
 
+  // phones keep a long scrollable feed; the projection keeps a tight one
+  const HISTORY_MAX = matchMedia("(max-width: 700px)").matches ? 60 : 6;
+
   function pushCurrentToHistory() {
     if (!lastComment || !lastComment.text) return;
     const d = document.createElement("div");
     d.className = "item";
     renderInto(d, lastComment, false);
     history.prepend(d);
-    while (history.childElementCount > 6) history.lastChild.remove();
+    while (history.childElementCount > HISTORY_MAX) history.lastChild.remove();
   }
 
   function renderInto(el, comment, withTs) {
@@ -280,6 +308,11 @@
   // audio feed currently is, playing at the same speed. YouTube caps
   // playbackRate at 2x; above that the periodic resync jump-cuts forward.
   fetch("/meta").then(r => r.json()).then(meta => {
+    if (meta.url && !params.has("noqr")) {
+      document.getElementById("qr-url").textContent = meta.url.replace("http://", "");
+      document.getElementById("qr").hidden = false;
+      document.body.classList.add("qr");
+    }
     if (!meta.youtube_id) return;
     document.getElementById("videobox").hidden = false;
     const tag = document.createElement("script");

@@ -40,7 +40,11 @@ uv run app.py --mock                  # no API key, canned comments
 
 ## Views
 
-- **http://localhost:8710** — clean projection page.
+- **http://localhost:8710** — clean projection page. A QR code in the corner
+  (hide with `/?noqr`) points phones at the LAN address, also printed at
+  startup — anyone in the room can follow along on their own device.
+- **On phones** the same page becomes a scrollable feed (long history, ticker
+  pinned to the bottom); add `?grade` for grading buttons.
 - **`/?chime`** — adds a soft two-note chime on each comment (click the page
   once to unlock audio).
 - **`/?ops`** — operator pane on the right: pipeline stage, trigger state
