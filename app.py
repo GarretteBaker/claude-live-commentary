@@ -57,8 +57,10 @@ Useful interventions:
 - supplying a crisp relevant fact, standard term, or canonical reference.
 
 Two refinements:
-- You may open a comment with one short verbatim quote of the transcript words you are responding to, on its own line formatted as "> their words". Quote only when it clarifies what the comment attaches to; the quote does not count toward the word limit.
+- Every comment must open with one short verbatim quote of the transcript words you are responding to, on its own line formatted as "> their words" (strip the timestamp and speaker label). The quote does not count toward the word limit.
 - If the room addresses you directly (e.g. "Claude", "the screen", "the commentary") or explicitly poses a question for you to answer, answer it — this outranks the PASS criteria, and the answer may run to 80 words.
+
+Each transcript line is prefixed with the wall-clock time it was transcribed, e.g. [14:03:52]. Use it to judge how recent a remark is and how fast the discussion is moving; never include timestamps in comments.
 
 Most turns should be PASS. When you decline, reply "PASS | <ten-word reason>" so the operator can tune the system; the reason is never projected. Otherwise output only the comment text (with its optional quote line) — no preamble or markdown."""
 
@@ -180,7 +182,7 @@ class SessionLog:
         d.mkdir(exist_ok=True)
         self.path = d / (time.strftime("%Y%m%d-%H%M%S") + ".jsonl")
         self.log("session_start", source=args.wav or "mic", speed=args.speed,
-                 model=args.claude_model, effort=args.effort,
+                 model=args.claude_model, effort=args.effort, fast=args.fast,
                  chattiness=config["chattiness"], whisper=args.whisper_model)
 
     def log(self, type_: str, **fields):
@@ -335,7 +337,7 @@ def transcriber_thread(audio_q: queue.Queue, args):
         prev_plain = " ".join(text for _who, text in lines)
         for who, text in lines:
             line = f"{who}: {text}" if who else text
-            transcript.append(line)
+            transcript.append(f"[{time.strftime('%H:%M:%S')}] {line}")
             print(f"[asr] ({dt:.2f}s) {line}")
             broadcaster.publish({"type": "transcript", "text": line})
             session_log.log("transcript", text=line)
@@ -379,14 +381,19 @@ def stream_claude(client, args, comment_id: int) -> tuple[str, float | None]:
     t0 = time.monotonic()
     first = None
     shown = ""
+    kwargs = {}
+    if args.fast:  # ~2.5x output speed at 2x price; thinking tokens too, so
+        kwargs = {"speed": "fast"}  # it cuts time-to-first-words directly
     with client.beta.messages.stream(
         model=args.claude_model,
         max_tokens=500,
-        betas=["server-side-fallback-2026-07-01"],
+        betas=["server-side-fallback-2026-07-01"]
+              + (["fast-mode-2026-02-01"] if args.fast else []),
         fallbacks="default",
         output_config={"effort": args.effort},
         system=build_system_prompt(),
         messages=[{"role": "user", "content": build_user_prompt()}],
+        **kwargs,
     ) as stream:
         text = ""
         for delta in stream.text_stream:
@@ -533,7 +540,14 @@ def make_app(args) -> FastAPI:
             import anthropic
             transient = (anthropic.APIConnectionError, anthropic.RateLimitError,
                          anthropic.InternalServerError)
-            if exc.thread.name == "commentator" and issubclass(exc.exc_type, transient):
+            # a 429 saying "0 fast mode tokens" means the org has no fast-mode
+            # allocation at all — permanent, don't relaunch into a crash loop
+            if "0 fast mode" in str(exc.exc_value):
+                print("[commentator] this org has no fast-mode quota — "
+                      "rerun without --fast", flush=True)
+                broadcaster.publish({"type": "status",
+                                     "text": "commentator crashed — see terminal"})
+            elif exc.thread.name == "commentator" and issubclass(exc.exc_type, transient):
                 print("[commentator] transient failure — restarting in 15s", flush=True)
                 broadcaster.publish({"type": "status", "text": "reconnecting to Claude…"})
 
@@ -628,6 +642,9 @@ def main():
     p.add_argument("--claude-model", default="claude-opus-5")
     p.add_argument("--effort", default="medium", choices=["low", "medium", "high"],
                    help="Claude reasoning effort; low is the main latency lever")
+    p.add_argument("--fast", action="store_true",
+                   help="Opus fast mode: ~2.5x generation speed at 2x price "
+                        "(research preview; claude-opus-5 / claude-opus-4-8 only)")
     p.add_argument("--chattiness", choices=list(CHATTINESS_ADDENDA), default="strict",
                    help="how low the commentary bar starts (retunable live from /?ops)")
     p.add_argument("--chatty", action="store_true",

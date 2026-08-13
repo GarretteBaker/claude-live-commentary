@@ -20,9 +20,11 @@ through whisper, so the prompt includes the freshest words, and the reply
 clear the reply isn't a PASS). Terminal logs every reply including PASSes with
 reasons, so you can see why it stays silent.
 
-Comments may open with a `> quoted words` line showing what they respond to
-(rendered as a small quote above the comment), and if the room addresses Claude
-directly it may answer at length (~80 words) instead of the usual ≤25.
+Every comment opens with a `> quoted words` line showing the transcript words
+it responds to (rendered as a small quote above the comment), and if the room
+addresses Claude directly it may answer at length (~80 words) instead of the
+usual ≤25. Transcript lines carry wall-clock timestamps that Claude sees (for
+judging recency) but never quotes.
 
 ## Run
 
@@ -70,7 +72,8 @@ terminal; while a Claude call is in flight the corner shows *thinking…*.
 | `--call-gap` | 10 | min seconds between Claude calls |
 | `--min-new-words` | 30 | skip the Claude call if less new speech than this |
 | `--claude-model` | `claude-opus-5` | |
-| `--effort` | `medium` | Claude reasoning effort — `low` is the main latency lever |
+| `--effort` | `medium` | Claude reasoning effort — `low` is a latency lever |
+| `--fast` | off | Opus fast mode: ~2.5× generation speed at 2× price (~2–4¢/call); cuts time-to-first-words without the quality cost of `--effort low` |
 
 The commentator system prompt is `COMMENTATOR_SYSTEM` at the top of `app.py`
 (with `CHATTINESS_ADDENDA` per chattiness level).
