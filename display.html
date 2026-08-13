@@ -315,12 +315,12 @@
   function feedMessage(ev) {
     const d = document.createElement("div");
     d.className = "msg";
-    const m = ev.text.match(/^([A-Z]+\d*(?:-\d+)?): (.*)$/s);
+    const m = ev.text.match(/^([A-Za-z]+\d*(?:-\d+)?): (.*)$/s);
     if (m) {
       if (m[1] !== feedLastWho) {
         const who = document.createElement("span");
         who.className = "who";
-        who.style.color = whoColor(m[1]);
+        who.style.color = whoColor(m[1].toUpperCase());
         who.textContent = m[1] + " ";
         d.append(who);
       }

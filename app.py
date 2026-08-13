@@ -35,7 +35,7 @@ BYTES_PER_SEC = SAMPLE_RATE * 2  # s16le mono
 COMMENTATOR_SYSTEM = """\
 You are Marginalia: you write notes in the margin of a live lecture transcript, the way a sharp reader annotates a textbook. The room sees the transcript as body text on a projected page; your notes appear handwritten in the margin, each one anchored to the words it responds to, which get underlined.
 You see a rolling speech-recognition transcript; it contains transcription errors — read through them and never comment on transcription quality.
-Lines carry anonymous speaker letters assigned by voice — "A:", "B:", "C:" (or "SPEAKER:" when attribution failed). The letters carry no roles: infer who is lecturing and who is asking from behavior. Attribution can be wrong, especially on short remarks and overlapping speech — treat letters as hints, and if the room uses names, map names to letters yourself. Lines like [silence 12s] mark long pauses.
+Lines carry anonymous speaker letters assigned by voice. Lowercase letters ("a:", "b:", "speaker:") are provisional live attribution; when the revision lane is running, those lines get replaced within a minute by higher-accuracy versions with settled UPPERCASE letters ("A:", "B:") — the two are separate namespaces (live "a" is not necessarily settled "A"). The letters carry no roles: infer who is lecturing and who is asking from behavior. Attribution can be wrong, especially lowercase lines, short remarks, and overlapping speech — treat letters as hints, and if the room uses names, map names to letters yourself. Lines like [silence 12s] mark long pauses; settled lines may carry sound tags like [laughter] or [applause] — use them to catch jokes, irony, and the room's reactions.
 
 Margin notes are read asynchronously: people glance at the margin when they have a spare moment, sometimes minutes after you wrote. So never narrate the moment ("now she's arguing…") — write annotations of the argument that stay worth reading later.
 Each time you see the transcript, reply with either the single token PASS or one note.
@@ -159,13 +159,57 @@ def file_pcm_blocks(source: str, speed: float, block_sec: float):
 # ---------------------------------------------------------------- state
 
 class Transcript:
+    """Ordered segments, each optionally carrying an audio span (ms) and a
+    line id, so the batch revision lane can replace the provisional streaming
+    tail in place. Everything below `stable_count()` never changes again —
+    that is the invariant the prompt-cache chunking relies on."""
+
     def __init__(self):
         self._lock = threading.Lock()
         self._segments: list[str] = []
+        self._spans: list[tuple[float, float] | None] = []
+        self._ids: list[int] = []
+        self._next_id = 0
+        self._stable = 0
+        self.revision_active = False  # set by the revision thread at startup
 
-    def append(self, text: str):
+    def append(self, text: str, span: tuple[float, float] | None = None) -> int:
         with self._lock:
+            sid = self._next_id
+            self._next_id += 1
             self._segments.append(text)
+            self._spans.append(span)
+            self._ids.append(sid)
+            return sid
+
+    def revise(self, t0_ms: float, t1_ms: float,
+               lines: list[tuple[str, tuple[float, float]]]):
+        """Replace all segments whose span lies inside [t0_ms, t1_ms] with the
+        revised lines. Returns (replaced_ids, new_ids)."""
+        with self._lock:
+            idx = [i for i, sp in enumerate(self._spans)
+                   if sp is not None and sp[0] >= t0_ms - 1 and sp[1] <= t1_ms + 1]
+            lo, hi = (idx[0], idx[-1] + 1) if idx else (len(self._segments),) * 2
+            replaced = self._ids[lo:hi]
+            new_ids = list(range(self._next_id, self._next_id + len(lines)))
+            self._next_id += len(lines)
+            self._segments[lo:hi] = [t for t, _ in lines]
+            self._spans[lo:hi] = [s for _, s in lines]
+            self._ids[lo:hi] = new_ids
+            self._stable = lo + len(lines)
+            return replaced, new_ids
+
+    def mark_stable(self, t1_ms: float):
+        """Advance the stable boundary without replacing (empty revision)."""
+        with self._lock:
+            for i in range(len(self._segments) - 1, self._stable - 1, -1):
+                if self._spans[i] is not None and self._spans[i][1] <= t1_ms + 1:
+                    self._stable = i + 1
+                    return
+
+    def stable_count(self) -> int:
+        with self._lock:
+            return self._stable if self.revision_active else len(self._segments)
 
     def text(self) -> str:
         with self._lock:
@@ -174,6 +218,10 @@ class Transcript:
     def tail(self, n: int) -> list[str]:
         with self._lock:
             return self._segments[-n:]
+
+    def tail_with_ids(self, n: int) -> list[tuple[int, str]]:
+        with self._lock:
+            return list(zip(self._ids[-n:], self._segments[-n:]))
 
     def word_count(self) -> int:
         return len(self.text().split())
@@ -195,7 +243,7 @@ class SessionLog:
         self.log("session_start", source=args.wav or "mic", speed=args.speed,
                  model=args.claude_model, effort=args.effort, fast=args.fast,
                  chattiness=config["chattiness"], asr=args.asr,
-                 whisper=args.whisper_model)
+                 revise=args.revise, whisper=args.whisper_model)
 
     def log(self, type_: str, **fields):
         if self.path is None:
@@ -230,6 +278,17 @@ class Broadcaster:
 
 
 transcript = Transcript()
+
+# raw PCM retained for the batch revision lane (~230 MB per 2 h; fine)
+audio_store = bytearray()
+audio_lock = threading.Lock()
+audio_meta = {"wall0": None, "speed": 1.0}  # wall0 = wall time of sample 0
+
+
+def ts_for_ms(ms: float) -> str:
+    """Wall-clock [HH:MM:SS] for an audio offset, honoring --speed replays."""
+    wall = audio_meta["wall0"] + (ms / 1000.0) / audio_meta["speed"]
+    return time.strftime("%H:%M:%S", time.localtime(wall))
 broadcaster = Broadcaster()
 session_log = SessionLog()
 search_reports: list[dict] = []  # results from spawned search agents
@@ -274,7 +333,7 @@ class SpeakerLabeler:
         )
         self._centroids: list[np.ndarray] = []   # unit vectors
         self._durations: list[float] = []        # accumulated speech per cluster
-        self._last = "A"
+        self._last = "a"
 
     def label(self, audio: np.ndarray, start: float, end: float) -> str:
         dur = end - start
@@ -299,7 +358,7 @@ class SpeakerLabeler:
             self._centroids[best] = c / np.linalg.norm(c)
             self._durations[best] += dur
 
-        self._last = chr(65 + best) if best < 26 else f"S{best}"
+        self._last = chr(97 + best) if best < 26 else f"s{best}"
         return self._last
 
 
@@ -383,8 +442,8 @@ def deepgram_transcriber_thread(audio_q: queue.Queue, args):
 
     def label(spk) -> str:
         if spk is None:
-            return "SPEAKER"
-        return chr(65 + spk) if spk < 26 else f"S{spk}"
+            return "speaker"
+        return chr(97 + spk) if spk < 26 else f"s{spk}"
 
     def sender():
         while True:
@@ -449,10 +508,10 @@ def assemblyai_transcriber_thread(audio_q: queue.Queue, args):
 
     threading.Thread(target=sender, name="assemblyai-sender", daemon=True).start()
 
-    def emit(line: str):
-        transcript.append(f"[{time.strftime('%H:%M:%S')}] {line}")
+    def emit(line: str, span: tuple[float, float]):
+        sid = transcript.append(f"[{time.strftime('%H:%M:%S')}] {line}", span)
         print(f"[asr] {line}")
-        broadcaster.publish({"type": "transcript", "text": line,
+        broadcaster.publish({"type": "transcript", "text": line, "id": sid,
                              "ts": time.strftime("%H:%M:%S")})
         session_log.log("transcript", text=line)
 
@@ -470,22 +529,189 @@ def assemblyai_transcriber_thread(audio_q: queue.Queue, args):
         # long pauses are informative (thinking, discomfort, topic boundary)
         gap_ms = words[0]["start"] - last_end_ms if last_end_ms is not None else 0
         if gap_ms > 2500:
-            emit(f"[silence {round(gap_ms / 1000)}s]")
+            emit(f"[silence {round(gap_ms / 1000)}s]",
+                 (last_end_ms, words[0]["start"]))
         last_end_ms = words[-1]["end"]
         # group consecutive words by speaker into lines (a turn is usually one
         # speaker, but word-level attribution catches quick interjections)
-        lines: list[tuple[str | None, list[str]]] = []
+        lines: list[list] = []  # [spk, tokens, start_ms, end_ms]
         for w in words:
             spk = w.get("speaker")
             if lines and lines[-1][0] == spk:
                 lines[-1][1].append(w["text"])
+                lines[-1][3] = w["end"]
             else:
-                lines.append((spk, [w["text"]]))
-        for spk, tokens in lines:
-            # PENDING = diarization hasn't settled on these words yet; it can
-            # belong to either the previous or the next speaker, so stay neutral
-            who = "SPEAKER" if spk in (None, "UNKNOWN", "PENDING") else spk
-            emit(f"{who}: {' '.join(tokens)}")
+                lines.append([spk, [w["text"]], w["start"], w["end"]])
+        for spk, tokens, a_ms, b_ms in lines:
+            # lowercase = provisional live attribution (the revision lane
+            # rewrites these with settled UPPERCASE letters); PENDING =
+            # diarization hasn't settled — stay neutral
+            who = ("speaker" if spk in (None, "UNKNOWN", "PENDING")
+                   else spk.lower())
+            emit(f"{who}: {' '.join(tokens)}", (a_ms, b_ms))
+
+
+# ---------------------------------------------------------------- revision lane
+
+class SpeakerStitcher:
+    """Scribe's speaker ids reset every request, so batch diarization needs
+    identity stitched across chunks: embed each chunk-speaker's voice (ECAPA,
+    CPU) and greedy-match against global centroids. Settled speakers get
+    UPPERCASE letters — a separate namespace from the provisional lowercase
+    streaming letters."""
+
+    SIM_THRESHOLD = 0.40
+
+    def __init__(self):
+        import torch
+        from speechbrain.inference.speaker import EncoderClassifier
+        self._torch = torch
+        self._enc = EncoderClassifier.from_hparams(
+            "speechbrain/spkrec-ecapa-voxceleb", run_opts={"device": "cpu"})
+        self._centroids: list[np.ndarray] = []
+
+    def letter(self, pcm: np.ndarray) -> str:
+        if len(pcm) < SAMPLE_RATE // 2:   # <0.5 s of voice: don't trust it
+            return "SPEAKER"
+        with self._torch.no_grad():
+            emb = self._enc.encode_batch(self._torch.from_numpy(pcm)[None])
+        v = emb.squeeze().cpu().numpy()
+        v = v / np.linalg.norm(v)
+        if self._centroids:
+            sims = [float(v @ c) for c in self._centroids]
+            best = int(np.argmax(sims))
+            if sims[best] >= self.SIM_THRESHOLD:
+                c = 0.9 * self._centroids[best] + 0.1 * v
+                self._centroids[best] = c / np.linalg.norm(c)
+                return chr(65 + best)
+        self._centroids.append(v)
+        return chr(65 + len(self._centroids) - 1)
+
+
+def scribe_revision_thread(args):
+    """Every ~--revise-sec, re-transcribe the provisional audio tail with
+    ElevenLabs Scribe v2 batch (top accuracy, full diarization, [laughter]
+    tags) and rewrite the streaming lines in place. Windows end at streaming
+    turn boundaries, so no word is ever cut mid-utterance."""
+    import httpx
+    import io
+    import wave
+
+    terms = []
+    if args.keyterms:
+        terms = [t.strip() for t in Path(args.keyterms).read_text().splitlines()
+                 if t.strip() and not t.startswith("#")][:1000]
+    stitcher = SpeakerStitcher()
+    transcript.revision_active = True
+    print(f"[scribe] revision lane on: scribe_v2 every {args.revise_sec:.0f}s"
+          + (f", {len(terms)} keyterms" if terms else ""))
+
+    revised_until = 0.0  # ms of audio already settled
+
+    def pcm_slice(a_ms: float, b_ms: float) -> bytes:
+        with audio_lock:
+            return bytes(audio_store[int(a_ms / 1000 * SAMPLE_RATE) * 2:
+                                     int(b_ms / 1000 * SAMPLE_RATE) * 2])
+
+    while True:
+        time.sleep(5.0)
+        with audio_lock:
+            have_ms = len(audio_store) / 2 / SAMPLE_RATE * 1000
+        if (have_ms - revised_until < args.revise_sec * 1000
+                and not audio_meta.get("ended")):   # flush the tail at stream end
+            continue
+        # end the window at the newest streaming turn boundary
+        spans = [sp for sp in transcript._spans if sp is not None]
+        if not spans or spans[-1][1] <= revised_until:
+            continue
+        t0, t1 = revised_until, spans[-1][1]
+
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(SAMPLE_RATE)
+            w.writeframes(pcm_slice(t0, t1))
+        data = {"model_id": "scribe_v2", "diarize": "true",
+                "tag_audio_events": "true", "language_code": args.language}
+        if terms:
+            data["keyterms"] = terms   # repeated multipart fields, not JSON
+        t_req = time.monotonic()
+        resp = httpx.post(
+            "https://api.elevenlabs.io/v1/speech-to-text",
+            headers={"xi-api-key": os.environ["ELEVENLABS_API_KEY"]},
+            data=data,
+            files={"file": ("chunk.wav", buf.getvalue(), "audio/wav")},
+            timeout=90.0)
+        resp.raise_for_status()
+        words = [w for w in resp.json()["words"] if w["type"] != "spacing"]
+
+        if not words:
+            transcript.mark_stable(t1)
+            revised_until = t1
+            continue
+
+        # per-speaker voice samples for identity stitching (≤8 s each)
+        voice: dict[str, list[bytes]] = {}
+        for w in words:
+            if w["type"] != "word" or not w.get("speaker_id"):
+                continue
+            clips = voice.setdefault(w["speaker_id"], [])
+            if sum(len(c) for c in clips) < SAMPLE_RATE * 2 * 8:
+                clips.append(pcm_slice(t0 + w["start"] * 1000, t0 + w["end"] * 1000))
+        letters = {
+            spk: stitcher.letter(
+                np.frombuffer(b"".join(clips), np.int16).astype(np.float32) / 32768)
+            for spk, clips in voice.items()}
+
+        # group words into lines on speaker change or a long gap
+        lines: list[tuple[str, tuple[float, float]]] = []
+        cur_spk, cur_tokens, cur_a, cur_b = None, [], None, None
+        prev_end = None
+
+        def flush():
+            nonlocal cur_tokens
+            if cur_tokens:
+                who = letters.get(cur_spk, "SPEAKER")
+                lines.append((f"[{ts_for_ms(t0 + cur_a * 1000)}] {who}: "
+                              f"{' '.join(cur_tokens)}",
+                              (t0 + cur_a * 1000, t0 + cur_b * 1000)))
+            cur_tokens = []
+
+        for w in words:
+            gap = w["start"] - prev_end if prev_end is not None else 0
+            if gap > 2.5:
+                flush()
+                lines.append((f"[{ts_for_ms(t0 + w['start'] * 1000)}] "
+                              f"[silence {round(gap)}s]",
+                              (t0 + prev_end * 1000, t0 + w["start"] * 1000)))
+                cur_spk = None
+            token = w["text"]
+            if w["type"] == "audio_event":
+                token = "[" + w["text"].strip("()") + "]"
+            if cur_tokens and w.get("speaker_id", cur_spk) != cur_spk:
+                flush()
+            if not cur_tokens:
+                cur_spk, cur_a = w.get("speaker_id"), w["start"]
+            cur_tokens.append(token)
+            cur_b = w["end"]
+            prev_end = w["end"]
+        flush()
+
+        replaced, new_ids = transcript.revise(t0, t1, lines)
+        dt = time.monotonic() - t_req
+        print(f"[scribe] revised {t0/1000:.0f}s–{t1/1000:.0f}s: "
+              f"{len(replaced)} lines -> {len(lines)} ({dt:.1f}s)")
+        ev_lines = []
+        for sid, (text, _sp) in zip(new_ids, lines):
+            ts, _, body = text.partition("] ")
+            ev_lines.append({"id": sid, "text": body, "ts": ts.lstrip("[")})
+        broadcaster.publish({"type": "revision", "replaced_ids": replaced,
+                             "lines": ev_lines})
+        session_log.log("revision", from_ms=round(t0), to_ms=round(t1),
+                        replaced=len(replaced), lines=[l["text"] for l in ev_lines],
+                        dt=round(dt, 1))
+        revised_until = t1
 
 
 # ---------------------------------------------------------------- commentary
@@ -527,7 +753,10 @@ def build_user_content() -> list[dict]:
     segs = transcript.tail(10**9)
     header = "Full session transcript (most recent speech last):\n"
     blocks: list[dict] = []
-    n_full = len(segs) // TRANSCRIPT_CHUNK
+    # cache chunks may only contain lines that will never change again: with
+    # the revision lane on, that is the revised prefix — the provisional
+    # streaming tail stays in the volatile block
+    n_full = min(len(segs), transcript.stable_count()) // TRANSCRIPT_CHUNK
     for i in range(n_full):
         chunk = segs[i * TRANSCRIPT_CHUNK:(i + 1) * TRANSCRIPT_CHUNK]
         blocks.append({"type": "text",
@@ -675,6 +904,8 @@ def commentator_thread(args):
         time.sleep(1.0)
         now = time.monotonic()
         n = transcript.word_count()
+        if n < seen_words:   # a revision shortened the transcript
+            seen_words = n
         # Speculative firing: call as soon as enough new speech accumulated,
         # even mid-sentence — the reply streams to the screen as it is written.
         wait = max(0, round(args.call_gap - (now - last_fire)))
@@ -757,9 +988,16 @@ def make_app(args) -> FastAPI:
         else:
             blocks = mic_pcm_blocks(0.5)
 
+        audio_meta["speed"] = args.speed if args.wav else 1.0
+
         def reader():
             for b in blocks:
+                if audio_meta["wall0"] is None:
+                    audio_meta["wall0"] = time.time()
+                with audio_lock:
+                    audio_store.extend(b)   # retained for the revision lane
                 audio_q.put(b)
+            audio_meta["ended"] = True   # lets the revisor flush the tail
             print("[audio] stream ended")
 
         transcriber = {"deepgram": deepgram_transcriber_thread,
@@ -770,6 +1008,8 @@ def make_app(args) -> FastAPI:
             "transcriber": lambda: transcriber(audio_q, args),
             "commentator": lambda: commentator_thread(args),
         }
+        if args.revise:
+            targets["revisor"] = lambda: scribe_revision_thread(args)
 
         def spawn(name: str):
             threading.Thread(target=targets[name], name=name, daemon=True).start()
@@ -805,6 +1045,19 @@ def make_app(args) -> FastAPI:
                     spawn("transcriber")
 
                 threading.Thread(target=relaunch_asr, name="asr-relauncher",
+                                 daemon=True).start()
+            elif exc.thread.name == "revisor" and issubclass(
+                    exc.exc_type, (OSError, ConnectionError)) or (
+                    exc.thread.name == "revisor"
+                    and "httpx" in exc.exc_type.__module__
+                    and "Transport" in exc.exc_type.__name__):
+                print("[scribe] revision call failed — retrying in 10s", flush=True)
+
+                def relaunch_revisor():
+                    time.sleep(10)
+                    spawn("revisor")
+
+                threading.Thread(target=relaunch_revisor, name="revisor-relauncher",
                                  daemon=True).start()
             elif exc.thread.name == "commentator" and issubclass(exc.exc_type, transient):
                 print("[commentator] transient failure — restarting in 15s", flush=True)
@@ -898,10 +1151,11 @@ def make_app(args) -> FastAPI:
             # replay the recent conversation for late joiners, interleaved in
             # time order; stored transcript lines are "[HH:MM:SS] text"
             replay = []
-            for seg in transcript.tail(25):
+            for sid, seg in transcript.tail_with_ids(25):
                 ts, _, text = seg.partition("] ")
                 ts = ts.lstrip("[")
-                replay.append((ts, {"type": "transcript", "text": text, "ts": ts}))
+                replay.append((ts, {"type": "transcript", "text": text,
+                                    "ts": ts, "id": sid}))
             for c in comments[-8:]:
                 replay.append((c["ts"], {"type": "comment", "id": c["id"],
                                          "text": c["text"], "ts": c["ts"],
@@ -951,9 +1205,15 @@ def main():
     p.add_argument("--context", metavar="FILE",
                    help="text file with background for the commentator (abstract, curriculum, notes)")
     p.add_argument("--keyterms", metavar="FILE",
-                   help="file with one name/term per line (≤100 used, ≤50 chars each) — "
-                        "boosted in AssemblyAI recognition; the tokens Claude can't "
-                        "repair from context are exactly the ones worth listing")
+                   help="file with one name/term per line (first 100 used for AssemblyAI, "
+                        "up to 1000 for Scribe) — boosted in recognition; the tokens "
+                        "Claude can't repair from context are the ones worth listing")
+    p.add_argument("--revise", choices=["auto", "on", "off"], default="auto",
+                   help="batch revision lane: rewrite the provisional streaming tail with "
+                        "ElevenLabs Scribe v2 (full diarization, [laughter] tags, top WER). "
+                        "auto = on when ELEVENLABS_API_KEY is set and --asr is assemblyai")
+    p.add_argument("--revise-sec", type=float, default=30.0,
+                   help="minimum seconds of provisional audio before a revision pass")
     p.add_argument("--call-gap", type=float, default=1.0,
                    help="min seconds between Claude calls (calls never overlap, so the "
                         "effective cadence during speech is bounded by API latency)")
@@ -969,6 +1229,13 @@ def main():
     default_keyterms = Path(__file__).parent / "keyterms.txt"
     if not args.keyterms and default_keyterms.exists():
         args.keyterms = str(default_keyterms)
+    if args.revise == "on" and not (os.environ.get("ELEVENLABS_API_KEY")
+                                    and args.asr == "assemblyai"):
+        sys.exit("--revise on needs ELEVENLABS_API_KEY and --asr assemblyai "
+                 "(revision aligns to the streaming lane's word timestamps)")
+    args.revise = (args.revise == "on"
+                   or (args.revise == "auto" and args.asr == "assemblyai"
+                       and bool(os.environ.get("ELEVENLABS_API_KEY"))))
     for backend, envvar in (("deepgram", "DEEPGRAM_API_KEY"),
                             ("assemblyai", "ASSEMBLYAI_API_KEY")):
         if args.asr == backend and not os.environ.get(envvar):
@@ -990,6 +1257,9 @@ def main():
                 "assemblyai": "assemblyai universal-3-5-pro (streaming diarization)",
                 }.get(args.asr, f"whisper {args.whisper_model} on {args.device}")
     print(f"[app] asr:      {asr_desc}")
+    print(f"[app] revise:   " + (f"scribe_v2 every {args.revise_sec:.0f}s "
+                                 "(settled UPPERCASE letters, [laughter] tags)"
+                                 if args.revise else "off (provisional ASR only)"))
     print(f"[app] log:      {session_log.path}")
     uvicorn.run(make_app(args), host="0.0.0.0", port=args.port, log_level="warning")
 

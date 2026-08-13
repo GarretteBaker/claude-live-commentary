@@ -48,8 +48,11 @@
   #text .para { margin-bottom: 0.9em; }
   #text .label {
     font: 600 0.68em system-ui, sans-serif; letter-spacing: 0.12em;
-    text-transform: uppercase; color: var(--label-ink); margin-right: 0.7em;
+    color: var(--label-ink); margin-right: 0.7em;
   }
+  /* provisional (lowercase, unrevised) lines sit lighter on the page until
+     the revision lane replaces them with settled text */
+  #text .prov { opacity: 0.55; }
   #text .pausemark {
     text-align: center; color: #c4bba8; font-size: 0.8em;
     letter-spacing: 0.3em; margin: 0.4em 0;
@@ -205,26 +208,37 @@
     return `hsl(${h}, 35%, 42%)`;
   }
 
-  function appendTranscript(text) {
-    if (/^\[silence \d+s\]$/.test(text)) {   // long pauses render as a gap mark
+  const lineEvents = [];   // {id, text, ts} in render order, for revisions
+
+  function appendTranscript(ev) {
+    lineEvents.push(ev);
+    renderLine(ev);
+  }
+
+  function renderLine(ev) {
+    const lid = ev.id ?? -1;
+    if (/^\[silence \d+s\]$/.test(ev.text)) {  // long pauses render as a gap mark
       const p = document.createElement("p");
       p.className = "pausemark";
-      p.textContent = "· · ·  " + text.slice(9, -1);
+      p.dataset.line = lid;
+      p.textContent = "· · ·  " + ev.text.slice(9, -1);
       textEl.append(p);
       para = null;
       layout();
       return;
     }
-    const m = text.match(/^([A-Z]+\d*(?:-\d+)?): (.*)$/s);
+    const m = ev.text.match(/^([A-Za-z]+\d*(?:-\d+)?): (.*)$/s);
     const who = m ? m[1] : paraWho;
-    const body = m ? m[2] : text;
+    const prov = !!(who && /[a-z]/.test(who));   // lowercase = provisional
+    const body = m ? m[2] : ev.text;
     if (!para || who !== paraWho || paraWords > 90) {
       para = document.createElement("p");
       para.className = "para";
       if (who) {
         const label = document.createElement("span");
-        label.className = "label";
-        label.style.color = whoColor(who);
+        label.className = "label" + (prov ? " prov" : "");
+        label.dataset.line = lid;
+        label.style.color = whoColor(who.toUpperCase());
         label.textContent = who;
         para.append(label);
       }
@@ -234,7 +248,8 @@
     for (const raw of body.split(/\s+/)) {
       if (!raw) continue;
       const span = document.createElement("span");
-      span.className = "w";
+      span.className = "w" + (prov ? " prov" : "");
+      span.dataset.line = lid;
       span.textContent = raw + " ";
       para.append(span);
       words.push({ n: norm(raw), el: span });
@@ -296,9 +311,10 @@
   }
 
   function anchorNote(note, quote) {
+    note.quote = quote;   // kept for re-anchoring after a revision
     note.anchorEls = findAnchor(quote);
     if (note.anchorEls) note.anchorEls.forEach(a => a.classList.add("anch"));
-    else if (quote) {
+    else if (quote && !note.el.querySelector(".lead")) {
       // quote didn't match the transcript (ASR drift): show it in the margin
       const lead = document.createElement("span");
       lead.className = "lead"; lead.textContent = "“" + quote + "”";
@@ -431,7 +447,33 @@
   es.onmessage = (m) => {
     const ev = JSON.parse(m.data);
     if (ev.type === "transcript") {
-      appendTranscript(ev.text);
+      appendTranscript(ev);
+    } else if (ev.type === "revision") {
+      // the batch lane rewrote the provisional tail: re-render everything
+      // from the first replaced line, keeping newer still-provisional lines
+      const removed = new Set(ev.replaced_ids);
+      let idx = lineEvents.findIndex(l => removed.has(l.id));
+      if (idx === -1) idx = lineEvents.length;
+      const retained = lineEvents.slice(idx).filter(l => !removed.has(l.id));
+      const toRemove = new Set(lineEvents.slice(idx).map(l => l.id));
+      lineEvents.length = idx;
+      textEl.querySelectorAll("[data-line]").forEach(el => {
+        if (toRemove.has(+el.dataset.line)) el.remove();
+      });
+      textEl.querySelectorAll("p").forEach(p => {
+        if (!p.querySelector(".w") && !p.classList.contains("pausemark")) p.remove();
+      });
+      while (words.length && !words[words.length - 1].el.isConnected) words.pop();
+      para = null; paraWho = null; paraWords = 0;
+      for (const l of ev.lines) appendTranscript(l);
+      for (const l of retained) appendTranscript(l);
+      for (const n of noteRegistry) {   // re-anchor notes into the new text
+        if (n.anchorEls && n.anchorEls.some(a => !a.isConnected)) {
+          n.anchorEls = null;
+          anchorNote(n, n.quote || "");
+        }
+      }
+      layout();
     } else if (ev.type === "comment") {              // replay for late joiners
       const note = makeNote(ev.id, ev.kind === "ask" ? "ask" : "");
       const { quote, body } = splitComment(ev.text);
