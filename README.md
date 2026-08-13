@@ -24,7 +24,7 @@ reasons, so you can see why it stays silent.
 Every comment opens with a `> quoted words` line showing the transcript words
 it responds to (rendered as a small quote above the comment), and if the room
 addresses Claude directly it may answer at length (~80 words) instead of the
-usual ≤25. Its name in the room is **Muse** (it answers to "Claude" too).
+usual ≤25. Its name in the room is **Marginalia** (it answers to "Claude" too).
 Transcript lines carry wall-clock timestamps that Claude sees (for judging
 recency) but never quotes. Comments may use LaTeX (`$...$`), rendered with
 KaTeX. Vote tallies from `/?grade` are fed back into its prompt ([2↑ 1↓]) so
@@ -48,7 +48,7 @@ uv run app.py --mock                  # no API key, canned comments
 
 - **http://localhost:8710** — projection page: the current comment large on
   the left, and the **full chat history** on the right (`?nofeed` hides it):
-  the labeled transcript with Muse's comments backfilled in place, plus a
+  the labeled transcript with Marginalia's comments backfilled in place, plus a
   notch at each point the transcript was sent to Claude, resolving to
   `commented` or `pass · reason` — the room can see exactly what it is
   thinking about. Late joiners get the recent conversation replayed in
@@ -63,7 +63,10 @@ uv run app.py --mock                  # no API key, canned comments
   recent PASSes with reasons and latencies, and live chattiness controls
   (strict / chatty / eager, effective on the next call).
 - **`/?grade`** — 👍/👎 buttons on every comment (also present in `?ops`);
-  open it on a phone to grade during a lecture. Grades land in the session log.
+  open it on a phone to grade during a lecture. After voting, an optional
+  "why?" note can be typed — it is **private to Marginalia** (fed into its
+  prompt alongside the vote tallies, never shown on any screen) and lands
+  in the session log.
 
 A crashed pipeline thread shows red in the page corner and a traceback in the
 terminal; while a Claude call is in flight the corner shows *thinking…*.

@@ -74,6 +74,14 @@
   }
   .gradebtns button.picked { border-color: #6faf7a; color: #e8e6e0; }
   .gradebtns button:disabled { cursor: default; opacity: 0.7; }
+  .gradenote {
+    background: #161a22; border: 1px solid #2c3240; color: #e8e6e0;
+    border-radius: 6px; font: 0.78rem system-ui, sans-serif;
+    padding: 0.25em 0.6em; margin-left: 0.5em; width: 200px; max-width: 45vw;
+  }
+  .gradenote::placeholder { color: #4a5262; }
+  .noted { color: #6faf7a; font: 0.75rem system-ui, sans-serif;
+           font-style: normal; margin-left: 0.5em; }
   /* --- operator pane (?ops) --- */
   #ops {
     position: fixed; top: 0; right: 0; bottom: 0; width: 330px; z-index: 1;
@@ -232,6 +240,22 @@
           body: JSON.stringify({ id, grade }) });
         span.querySelectorAll("button").forEach(x => { x.disabled = true; });
         b.classList.add("picked");
+        // optional private note — goes into Marginalia's prompt, never on screen
+        const input = document.createElement("input");
+        input.className = "gradenote";
+        input.placeholder = "why? (only Marginalia sees this)";
+        input.maxLength = 300;
+        input.addEventListener("keydown", (k) => {
+          if (k.key !== "Enter" || !input.value.trim()) return;
+          fetch("/grade_note", { method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ id, grade, note: input.value.trim() }) });
+          const ok = document.createElement("span");
+          ok.className = "noted"; ok.textContent = "noted ✓";
+          input.replaceWith(ok);
+        });
+        span.append(input);
+        input.focus();
       });
       span.append(b);
     });
@@ -290,14 +314,14 @@
     feedAppend(d);
   }
 
-  // Muse's comments are backfilled into the chat at their notch position,
+  // Marginalia's comments are backfilled into the chat at their notch position,
   // so the feed is the full conversation history
   function feedComment(c) {
     const d = document.createElement("div");
     d.className = "msg muse";
     const who = document.createElement("span");
     who.className = "who";
-    who.textContent = "MUSE" + (c.ts ? " · " + c.ts : "");
+    who.textContent = "MARGINALIA" + (c.ts ? " · " + c.ts : "");
     const body = document.createElement("div");
     renderInto(body, c, false);
     d.append(who, body);

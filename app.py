@@ -58,11 +58,11 @@ Useful interventions:
 
 Two refinements:
 - Every comment must open with one short verbatim quote of the transcript words you are responding to, on its own line formatted as "> their words" (strip the timestamp and speaker label). The quote does not count toward the word limit.
-- If the room addresses you directly or explicitly poses a question for you to answer, answer it — this outranks the PASS criteria, and the answer may run to 80 words. Your name in the room is "Muse"; treat "Muse", "Claude", "the screen", or "the commentary" all as direct address (transcription may garble the name — read generously).
+- If the room addresses you directly or explicitly poses a question for you to answer, answer it — this outranks the PASS criteria, and the answer may run to 80 words. Your name in the room is "Marginalia"; treat "Marginalia", "Claude", "the screen", or "the commentary" all as direct address (transcription may garble the name — read generously).
 
 Each transcript line is prefixed with the wall-clock time it was transcribed, e.g. [14:03:52]. Use it to judge how recent a remark is and how fast the discussion is moving; never include timestamps in comments.
 
-The room can vote on your comments; previous comments may carry tallies like [2↑ 1↓]. Use them to calibrate what kind of intervention this audience values — and raise the PASS bar after downvotes.
+The room can vote on your comments; previous comments may carry tallies like [2↑ 1↓] and private voter notes explaining the vote. The notes are visible only to you — never quote, mention, or respond to them on screen. Use them to calibrate what this audience values, and raise the PASS bar after downvotes.
 
 Most turns should be PASS. When you decline, reply "PASS | <ten-word reason>" so the operator can tune the system; the reason is never projected. Otherwise output only the comment text (with its quote line) — no preamble or markdown. LaTeX math with $...$ or $$...$$ delimiters renders on the screen; use it for formulas."""
 
@@ -366,9 +366,16 @@ def transcriber_thread(audio_q: queue.Queue, args):
 
 def build_user_prompt() -> str:
     text = transcript.text()[-12000:]  # rolling window
-    prev = "\n".join(
-        f"- {'[' + str(c['up']) + '↑ ' + str(c['down']) + '↓] ' if c['up'] or c['down'] else ''}{c['text']}"
-        for c in comments[-10:]) or "(none)"
+
+    def fmt(c: dict) -> str:
+        tally = f"[{c['up']}↑ {c['down']}↓] " if c["up"] or c["down"] else ""
+        line = f"- {tally}{c['text']}"
+        if c["notes"]:
+            joined = "; ".join(f'({n["grade"]}) "{n["note"]}"' for n in c["notes"][-5:])
+            line += f"\n  private voter notes: {joined}"
+        return line
+
+    prev = "\n".join(fmt(c) for c in comments[-10:]) or "(none)"
     return (f"Your previous comments:\n{prev}\n\n"
             f"Rolling transcript (most recent speech last):\n{text}\n\n"
             f"Reply with PASS or one comment.")
@@ -497,7 +504,7 @@ def commentator_thread(args):
             continue
         comment = {"id": comment_id, "text": reply,
                    "ts": time.strftime("%H:%M:%S"),
-                   "up": 0, "down": 0,
+                   "up": 0, "down": 0, "notes": [],
                    "context": transcript.text()[-1500:]}
         comments.append(comment)
         broadcaster.publish({"type": "comment_done", "id": comment["id"],
@@ -618,6 +625,18 @@ def make_app(args) -> FastAPI:
         session_log.log("grade", id=c["id"], comment=c["text"],
                         grade=body["grade"], note=body.get("note", ""))
         print(f"[grade] #{c['id']} {body['grade']} (now {c['up']}↑ {c['down']}↓)")
+        return {"ok": True}
+
+    @app.post("/grade_note")
+    async def grade_note(body: dict):
+        """A voter's private explanation — fed to the commentator, never shown."""
+        c = comments[int(body["id"])]
+        note = body.get("note", "").strip()[:300]
+        if note:
+            c["notes"].append({"grade": body.get("grade", ""), "note": note})
+            session_log.log("grade_note", id=c["id"], grade=body.get("grade", ""),
+                            note=note)
+            print(f"[grade] #{c['id']} note: {note}")
         return {"ok": True}
 
     @app.get("/events")
