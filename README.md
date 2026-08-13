@@ -12,9 +12,10 @@ each opportunity Claude sees the labeled rolling transcript + its previous
 comments and replies `PASS | reason` or one ≤25-word comment → FastAPI page
 (SSE) styled for projection.
 
-Claude calls fire **speculatively**: as soon as `--min-new-words` new words
-have arrived and `--call-gap` seconds have passed since the last call — even
-mid-speech. Right before each call the partially-filled audio chunk is flushed
+Claude calls fire **continuously**: whenever any new words have arrived
+(`--min-new-words`, default 1) and `--call-gap` seconds (default 1) have
+passed since the last call — even mid-speech. Calls never overlap, so during
+dense speech the effective cadence is bounded by the API latency (~3–4 s). Right before each call the partially-filled audio chunk is flushed
 through whisper, so the prompt includes the freshest words, and the reply
 **streams to the screen word by word** as it is written (withheld until it is
 clear the reply isn't a PASS). Terminal logs every reply including PASSes with
@@ -75,8 +76,8 @@ terminal; while a Claude call is in flight the corner shows *thinking…*.
 | `--device` | `auto` | cuda when available (nvidia pip wheels; app re-execs once to set `LD_LIBRARY_PATH`) |
 | `--chunk-sec` | 7 | transcription chunk length (latency vs. context) |
 | `--no-speakers` | off | disable LECTURER/AUDIENCE labeling |
-| `--call-gap` | 10 | min seconds between Claude calls |
-| `--min-new-words` | 30 | skip the Claude call if less new speech than this |
+| `--call-gap` | 1 | min seconds between Claude calls (calls never overlap) |
+| `--min-new-words` | 1 | skip the Claude call if less new speech than this |
 | `--claude-model` | `claude-opus-5` | |
 | `--effort` | `medium` | Claude reasoning effort — `low` is a latency lever |
 | `--fast` | off | Opus fast mode: ~2.5× generation speed at 2× price (~2–4¢/call); cuts time-to-first-words without the quality cost of `--effort low` |
@@ -92,8 +93,9 @@ total latency; PASSes with reasons), live config changes, grades, and thread
 crashes with tracebacks — enough to replay or grade any demo after the fact.
 
 Cost: each call is one small Opus call (~1–3k tokens in, ~50 out), about
-1–2¢. Calls fire every ≥`--call-gap` seconds during dense speech, so a
-2-hour session ≈ $5–15 at defaults.
+1–2¢. At the default continuous cadence (~one call per 3–4 s of dense
+speech) a 2-hour session ≈ $30–70; raise `--call-gap` (e.g. 10) and
+`--min-new-words` (e.g. 30) for the older, cheaper cadence.
 
 ## Known limitations (MVP)
 

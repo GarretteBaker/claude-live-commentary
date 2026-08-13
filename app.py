@@ -668,10 +668,11 @@ def main():
                    help="shorthand for --chattiness chatty")
     p.add_argument("--context", metavar="FILE",
                    help="text file with background for the commentator (abstract, curriculum, notes)")
-    p.add_argument("--call-gap", type=float, default=10.0,
-                   help="min seconds between Claude calls")
-    p.add_argument("--min-new-words", type=int, default=30,
-                   help="skip commentary unless this many new words arrived")
+    p.add_argument("--call-gap", type=float, default=1.0,
+                   help="min seconds between Claude calls (calls never overlap, so the "
+                        "effective cadence during speech is bounded by API latency)")
+    p.add_argument("--min-new-words", type=int, default=1,
+                   help="skip the Claude call unless this many new words arrived")
     p.add_argument("--port", type=int, default=8710)
     args = p.parse_args()
 
