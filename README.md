@@ -23,8 +23,11 @@ reasons, so you can see why it stays silent.
 Every comment opens with a `> quoted words` line showing the transcript words
 it responds to (rendered as a small quote above the comment), and if the room
 addresses Claude directly it may answer at length (~80 words) instead of the
-usual ≤25. Transcript lines carry wall-clock timestamps that Claude sees (for
-judging recency) but never quotes.
+usual ≤25. Its name in the room is **Muse** (it answers to "Claude" too).
+Transcript lines carry wall-clock timestamps that Claude sees (for judging
+recency) but never quotes. Comments may use LaTeX (`$...$`), rendered with
+KaTeX. Vote tallies from `/?grade` are fed back into its prompt ([2↑ 1↓]) so
+it can calibrate to the room.
 
 ## Run
 
@@ -42,9 +45,12 @@ uv run app.py --mock                  # no API key, canned comments
 
 ## Views
 
-- **http://localhost:8710** — clean projection page. A QR code in the corner
-  (hide with `/?noqr`) points phones at the LAN address, also printed at
-  startup — anyone in the room can follow along on their own device.
+- **http://localhost:8710** — projection page: comments on the left, the live
+  labeled transcript on the right (`?nofeed` hides it) with a **notch at each
+  point the transcript was sent to Claude**, resolving to `commented` or
+  `pass · reason` — so the room can see what it is thinking about. A QR code
+  in the corner (hide with `/?noqr`) points phones at the LAN address, also
+  printed at startup.
 - **On phones** the same page becomes a scrollable feed (long history, ticker
   pinned to the bottom); add `?grade` for grading buttons.
 - **`/?chime`** — adds a soft two-note chime on each comment (click the page

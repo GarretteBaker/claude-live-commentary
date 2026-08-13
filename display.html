@@ -4,6 +4,9 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Live Commentary</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"></script>
 <style>
   :root { color-scheme: dark; }
   * { margin: 0; box-sizing: border-box; }
@@ -97,6 +100,28 @@
   #ops-chat button.picked { border-color: #c9a45a; color: #e8e6e0; }
   #ops-passes div { margin-bottom: 0.35rem; }
   #ops-passes .t { color: #4a5262; }
+  /* --- live transcript feed with send-to-Claude notches --- */
+  #feed {
+    flex: 0 0 26vw; min-width: 260px; border-left: 1px solid #1c2028;
+    padding: 2.6rem 1rem 1rem; overflow-y: auto;
+    font: 0.82rem/1.45 system-ui, sans-serif; color: #8a92a2;
+  }
+  #feed[hidden] { display: none; }
+  #feed .msg { margin-bottom: 0.55rem; }
+  #feed .who { font-weight: 600; color: #a8b0c0; }
+  #feed .who.audience { color: #c9a45a; }
+  #feed .t { color: #3d4452; font-size: 0.7rem; margin-left: 0.4em; }
+  #feed .notch {
+    display: flex; align-items: center; gap: 0.6em; margin: 0.7rem 0;
+    color: #6faf7a; font-size: 0.72rem; letter-spacing: 0.05em;
+    text-transform: uppercase; white-space: nowrap;
+  }
+  #feed .notch::before, #feed .notch::after {
+    content: ""; flex: 1; border-top: 1px dashed #2c3240;
+  }
+  #feed .notch.pass { color: #4a5262; white-space: normal; text-transform: none; }
+  #feed .notch.commented { color: #e8e6e0; }
+  body.feed #ticker { display: none; }  /* the feed supersedes the ticker */
   /* --- QR corner: phones in the room scan to follow along --- */
   #qr {
     position: fixed; left: 1.2rem; bottom: 3.4rem; z-index: 1;
@@ -110,7 +135,7 @@
   @media (max-width: 700px) {
     body { height: auto; min-height: 100dvh; overflow-y: auto; }
     #top { flex-direction: column; flex: none; }
-    #videobox, #qr { display: none; }
+    #videobox, #qr, #feed { display: none; }
     #main { padding: 4.5rem 7vw 2rem; justify-content: flex-start; flex: none; }
     #current { font-size: 1.5rem; }
     #history { max-height: none; overflow: visible; padding-bottom: 3.4rem; }
@@ -131,6 +156,7 @@
       <div id="starthint">click to start the video in sync with the feed</div>
     </div>
     <div id="main"><div id="current"></div></div>
+    <div id="feed" hidden></div>
   </div>
   <div id="history"></div>
   <div id="ticker"></div>
@@ -171,6 +197,20 @@
     status.classList.toggle("live", !crashed && !text.startsWith("thinking"));
     const opsStage = document.getElementById("ops-stage");
     if (opsStage) opsStage.textContent = "stage: " + text;
+  }
+
+  // KaTeX auto-render; harmless no-op while the CDN script hasn't loaded
+  function katexify(el) {
+    if (typeof renderMathInElement === "undefined") return;
+    renderMathInElement(el, {
+      delimiters: [
+        { left: "$$", right: "$$", display: true },
+        { left: "$", right: "$", display: false },
+        { left: "\\(", right: "\\)", display: false },
+        { left: "\\[", right: "\\]", display: true },
+      ],
+      throwOnError: false,
+    });
   }
 
   // split an optional leading "> quote" line off the comment body
@@ -227,6 +267,56 @@
       ts.className = "ts"; ts.textContent = comment.ts;
       el.append(ts);
     }
+    katexify(el);
+  }
+
+  // --- live transcript feed (right side) with send-to-Claude notches ---
+  const feed = document.getElementById("feed");
+  const feedOn = !params.has("nofeed");
+  if (feedOn) { feed.hidden = false; document.body.classList.add("feed"); }
+  let pendingNotch = null;   // the notch for the Claude call in flight
+
+  function feedAppend(el) {
+    const stick = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 60;
+    feed.append(el);
+    while (feed.childElementCount > 120) feed.firstChild.remove();
+    if (stick) feed.scrollTop = feed.scrollHeight;
+  }
+
+  function feedMessage(ev) {
+    const d = document.createElement("div");
+    d.className = "msg";
+    const m = ev.text.match(/^(LECTURER|AUDIENCE-\d+): (.*)$/s);
+    if (m) {
+      const who = document.createElement("span");
+      who.className = "who" + (m[1].startsWith("AUDIENCE") ? " audience" : "");
+      who.textContent = m[1] + " ";
+      d.append(who, document.createTextNode(m[2]));
+    } else {
+      d.append(document.createTextNode(ev.text));
+    }
+    if (ev.ts) {
+      const t = document.createElement("span");
+      t.className = "t"; t.textContent = ev.ts;
+      d.append(t);
+    }
+    katexify(d);
+    feedAppend(d);
+  }
+
+  function feedNotch(ts) {
+    const d = document.createElement("div");
+    d.className = "notch";
+    d.textContent = `sent to claude ${ts} · thinking…`;
+    pendingNotch = { el: d, ts };
+    feedAppend(d);
+  }
+
+  function resolveNotch(cls, label) {
+    if (!pendingNotch) return;
+    pendingNotch.el.classList.add(cls);
+    pendingNotch.el.textContent = `sent to claude ${pendingNotch.ts} · ${label}`;
+    pendingNotch = null;
   }
 
   const es = new EventSource("/events");
@@ -238,12 +328,14 @@
     if (ev.type === "transcript") {
       tickerText = (tickerText + " " + ev.text).slice(-300);
       ticker.textContent = tickerText;
+      if (feedOn) feedMessage(ev);
     } else if (ev.type === "comment") {          // full comment (replay for late joiners)
       pushCurrentToHistory();
       lastComment = { id: ev.id, text: ev.text };
       renderInto(current, ev, true);
       current.classList.add("shown");
     } else if (ev.type === "comment_start" || ev.type === "comment_delta") {
+      if (ev.type === "comment_start") resolveNotch("commented", "commented ↓");
       if (!lastComment || lastComment.id !== ev.id) {   // new comment beginning
         pushCurrentToHistory();
         lastComment = { id: ev.id, text: "", ts: ev.ts || "" };
@@ -266,18 +358,22 @@
       setStatus(ev.text);
     } else if (ev.type === "stage") {
       if (!crashed) setStatus(ev.text === "listening" ? "live" : ev.text);
+      if (feedOn && ev.text === "thinking…") feedNotch(ev.ts || "");
     } else if (ev.type === "tick" && opsOn) {
       const wordsOk = ev.new_words >= ev.need_words ? "✓" : "✗";
       document.getElementById("ops-tick").textContent =
         `${ev.new_words}/${ev.need_words} new words ${wordsOk} · ` +
         (ev.wait > 0 ? `next call in ≥${ev.wait}s` : "call ready");
-    } else if (ev.type === "pass" && opsOn) {
-      const d = document.createElement("div");
-      d.innerHTML = `<span class="t">${ev.ts} (${ev.dt}s)</span> `;
-      d.append(document.createTextNode(ev.text || "(no reason given)"));
-      const passes = document.getElementById("ops-passes");
-      passes.prepend(d);
-      while (passes.childElementCount > 10) passes.lastChild.remove();
+    } else if (ev.type === "pass") {
+      resolveNotch("pass", "pass · " + (ev.text || "no reason").slice(0, 70));
+      if (opsOn) {
+        const d = document.createElement("div");
+        d.innerHTML = `<span class="t">${ev.ts} (${ev.dt}s)</span> `;
+        d.append(document.createTextNode(ev.text || "(no reason given)"));
+        const passes = document.getElementById("ops-passes");
+        passes.prepend(d);
+        while (passes.childElementCount > 10) passes.lastChild.remove();
+      }
     } else if (ev.type === "config") {
       markChattiness(ev.chattiness);
     }

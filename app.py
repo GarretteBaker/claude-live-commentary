@@ -58,11 +58,13 @@ Useful interventions:
 
 Two refinements:
 - Every comment must open with one short verbatim quote of the transcript words you are responding to, on its own line formatted as "> their words" (strip the timestamp and speaker label). The quote does not count toward the word limit.
-- If the room addresses you directly (e.g. "Claude", "the screen", "the commentary") or explicitly poses a question for you to answer, answer it — this outranks the PASS criteria, and the answer may run to 80 words.
+- If the room addresses you directly or explicitly poses a question for you to answer, answer it — this outranks the PASS criteria, and the answer may run to 80 words. Your name in the room is "Muse"; treat "Muse", "Claude", "the screen", or "the commentary" all as direct address (transcription may garble the name — read generously).
 
 Each transcript line is prefixed with the wall-clock time it was transcribed, e.g. [14:03:52]. Use it to judge how recent a remark is and how fast the discussion is moving; never include timestamps in comments.
 
-Most turns should be PASS. When you decline, reply "PASS | <ten-word reason>" so the operator can tune the system; the reason is never projected. Otherwise output only the comment text (with its optional quote line) — no preamble or markdown."""
+The room can vote on your comments; previous comments may carry tallies like [2↑ 1↓]. Use them to calibrate what kind of intervention this audience values — and raise the PASS bar after downvotes.
+
+Most turns should be PASS. When you decline, reply "PASS | <ten-word reason>" so the operator can tune the system; the reason is never projected. Otherwise output only the comment text (with its quote line) — no preamble or markdown. LaTeX math with $...$ or $$...$$ delimiters renders on the screen; use it for formulas."""
 
 CHATTINESS_ADDENDA = {
     "strict": "",
@@ -163,6 +165,10 @@ class Transcript:
     def text(self) -> str:
         with self._lock:
             return "\n".join(self._segments)
+
+    def tail(self, n: int) -> list[str]:
+        with self._lock:
+            return self._segments[-n:]
 
     def word_count(self) -> int:
         return len(self.text().split())
@@ -339,7 +345,8 @@ def transcriber_thread(audio_q: queue.Queue, args):
             line = f"{who}: {text}" if who else text
             transcript.append(f"[{time.strftime('%H:%M:%S')}] {line}")
             print(f"[asr] ({dt:.2f}s) {line}")
-            broadcaster.publish({"type": "transcript", "text": line})
+            broadcaster.publish({"type": "transcript", "text": line,
+                                 "ts": time.strftime("%H:%M:%S")})
             session_log.log("transcript", text=line)
 
     while True:
@@ -359,7 +366,9 @@ def transcriber_thread(audio_q: queue.Queue, args):
 
 def build_user_prompt() -> str:
     text = transcript.text()[-12000:]  # rolling window
-    prev = "\n".join(f"- {c['text']}" for c in comments[-10:]) or "(none)"
+    prev = "\n".join(
+        f"- {'[' + str(c['up']) + '↑ ' + str(c['down']) + '↓] ' if c['up'] or c['down'] else ''}{c['text']}"
+        for c in comments[-10:]) or "(none)"
     return (f"Your previous comments:\n{prev}\n\n"
             f"Rolling transcript (most recent speech last):\n{text}\n\n"
             f"Reply with PASS or one comment.")
@@ -468,7 +477,8 @@ def commentator_thread(args):
         seen_words = transcript.word_count()
         comment_id = len(comments)
 
-        broadcaster.publish({"type": "stage", "text": "thinking…"})
+        broadcaster.publish({"type": "stage", "text": "thinking…",
+                             "ts": time.strftime("%H:%M:%S")})
         t0 = time.monotonic()
         if args.mock:
             reply, ttfw = stream_mock(comment_id)
@@ -487,6 +497,7 @@ def commentator_thread(args):
             continue
         comment = {"id": comment_id, "text": reply,
                    "ts": time.strftime("%H:%M:%S"),
+                   "up": 0, "down": 0,
                    "context": transcript.text()[-1500:]}
         comments.append(comment)
         broadcaster.publish({"type": "comment_done", "id": comment["id"],
@@ -602,16 +613,22 @@ def make_app(args) -> FastAPI:
     @app.post("/grade")
     async def grade(body: dict):
         c = comments[int(body["id"])]
+        if body["grade"] in ("up", "down"):
+            c[body["grade"]] += 1
         session_log.log("grade", id=c["id"], comment=c["text"],
                         grade=body["grade"], note=body.get("note", ""))
-        print(f"[grade] #{c['id']} {body['grade']}")
+        print(f"[grade] #{c['id']} {body['grade']} (now {c['up']}↑ {c['down']}↓)")
         return {"ok": True}
 
     @app.get("/events")
     async def events():
         async def gen():
             q = broadcaster.subscribe()
-            # replay context for late joiners
+            # replay context for late joiners; stored lines are "[HH:MM:SS] text"
+            for seg in transcript.tail(15):
+                ts, _, text = seg.partition("] ")
+                yield ("data: " + json.dumps({"type": "transcript",
+                                              "text": text, "ts": ts.lstrip("[")}) + "\n\n")
             for c in comments[-5:]:
                 yield ("data: " + json.dumps({"type": "comment", "id": c["id"],
                                               "text": c["text"], "ts": ""}) + "\n\n")
