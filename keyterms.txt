@@ -1,0 +1,98 @@
+claude
+Marginalia
+RLCT
+Garrett Baker
+Alexander Gietelink Oldenziel
+singular learning theory
+local learning coefficient
+SGLD
+devinterp
+Watanabe
+free energy
+Hessian
+degeneracy
+Iliad
+Timaeus
+MIRI
+Redwood Research
+Meridian Cambridge
+EleutherAI
+ARENA
+AIXI
+Solomonoff induction
+Kolmogorov complexity
+computational mechanics
+epsilon-machine
+mixed state presentation
+mechanistic interpretability
+sparse autoencoders
+induction heads
+residual stream
+grokking
+steganography
+Eliciting Latent Knowledge
+Coherent Extrapolated Volition
+FairBot
+Joar Skalse
+Marcus Hutter
+Eliezer Yudkowsky
+Paul Christiano
+John Wentworth
+Evan Hubinger
+Chris Olah
+Steven Byrnes
+Nora Belrose
+Paul Riechers
+Leon Lang
+Zach Furman
+Matthew Farrugia-Roberts
+Guillaume Corlouer
+Louis Jaburi
+Julian Schulz
+Adam Newgas
+Xavier Poncini
+David Quarel
+Daniel Chiang
+Satya Benson
+Kai Ogden
+Dmitrii Vaintrob
+Noah Topper
+Aaron Gutknecht
+Aashiq Muhamed
+Abhinav Chand
+Alexander Bestwick
+Amalrose Vayalinkal
+Anant Shri
+Andrea Chen
+Dan Wilhelm
+Daniel Armando Tirado
+David Prinz
+David Zeidler
+Dawn Chen
+Emanuel Ruzak
+Greg Rosenthal
+Guillermo Sanmarco
+Hak Hyun Kim
+Hatem Elshatlawy
+Jose Faustino
+Joshua Kames-King
+Joshua Sangbeom Park
+Kalyaan Rao
+Karl Munthe
+Krishna Pothapragada
+Lucas Chen
+Lukasz Karwacki
+Marc Franquesa Monés
+Merijn Moody
+Paolo Pichini
+Radu-Alexandru Iacob
+Raghuram Sundararajan
+Ruxandra Icleanu
+Sabína Gulčíková
+Samantha Pease
+Sandy Tanwisuth
+Siddharth Setlur
+Simon Elias Schrader
+Trinidad Borrell
+Vincent Tran
+Will Lancer

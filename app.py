@@ -965,6 +965,9 @@ def main():
         args.asr = ("assemblyai" if os.environ.get("ASSEMBLYAI_API_KEY")
                     else "deepgram" if os.environ.get("DEEPGRAM_API_KEY")
                     else "whisper")
+    default_keyterms = Path(__file__).parent / "keyterms.txt"
+    if not args.keyterms and default_keyterms.exists():
+        args.keyterms = str(default_keyterms)
     for backend, envvar in (("deepgram", "DEEPGRAM_API_KEY"),
                             ("assemblyai", "ASSEMBLYAI_API_KEY")):
         if args.asr == backend and not os.environ.get(envvar):
