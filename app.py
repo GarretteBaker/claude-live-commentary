@@ -428,8 +428,9 @@ def assemblyai_transcriber_thread(audio_q: queue.Queue, args):
               "sample_rate": "16000", "format_turns": "true",
               "speaker_labels": "true"}
     if args.keyterms:
+        # priority-ordered file: first 100 non-comment lines are used (API cap)
         terms = [t.strip() for t in Path(args.keyterms).read_text().splitlines()
-                 if t.strip()][:100]
+                 if t.strip() and not t.startswith("#")][:100]
         params["keyterms_prompt"] = json.dumps(terms)
         print(f"[assemblyai] boosting {len(terms)} keyterms")
     if config["context"]:
