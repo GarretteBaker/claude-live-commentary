@@ -1,0 +1,513 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Marginalia</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"></script>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Caveat:wght@500;600;700&family=Kalam:wght@400;700&family=Shadows+Into+Light&family=Patrick+Hand&family=Nanum+Pen+Script&family=Homemade+Apple&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --paper: #f6f1e4;
+    --paper-edge: #ece4d0;
+    --body-ink: #8a8172;      /* deliberately faint: the transcript is scaffolding */
+    --label-ink: #a89c86;
+    --note-ink: #26437c;      /* ballpoint blue-black */
+    --note-ink-soft: rgba(38, 67, 124, 0.55);
+    --pencil: #9a917f;
+  }
+  * { margin: 0; box-sizing: border-box; }
+  body {
+    background: var(--paper); color: var(--body-ink);
+    font-family: Georgia, "Iowan Old Style", serif;
+    background-image: linear-gradient(90deg, var(--paper-edge) 0, var(--paper) 26px);
+  }
+  #status {
+    position: fixed; top: 0.9rem; right: 1.2rem; z-index: 3;
+    font: 0.72rem/1 system-ui, sans-serif; color: #b8ad97;
+    letter-spacing: 0.08em; text-transform: uppercase;
+  }
+  #status.live { color: #7d9a6e; }
+  #status.thinking { color: #b08d4f; }
+  #status.crashed { color: #b45a5a; }
+
+  #book {
+    position: relative; max-width: 1360px; margin: 0 auto;
+    padding: 4.5rem 0 40vh;   /* bottom slack so the newest line sits mid-screen */
+  }
+  #text {
+    width: 56%; margin-left: 5%;
+    font-size: clamp(15px, 1.25vw, 19px); line-height: 1.75;
+    text-align: justify; hyphens: auto;
+    transition: opacity 0.5s ease;
+  }
+  body.ghost #text { opacity: 0.06; }
+  #text .para { margin-bottom: 0.9em; }
+  #text .label {
+    font: 600 0.68em system-ui, sans-serif; letter-spacing: 0.12em;
+    text-transform: uppercase; color: var(--label-ink); margin-right: 0.7em;
+  }
+  #text .label.audience { color: #ad8b56; }
+  /* anchor words: the phrase a margin note points at */
+  #text .w.anch {
+    color: #4a4336;
+    text-decoration: underline; text-decoration-color: var(--note-ink-soft);
+    text-decoration-thickness: 2px; text-underline-offset: 4px;
+  }
+  #text .w.anch.hot {
+    background: rgba(38, 67, 124, 0.10); color: #26324a;
+  }
+
+  #notes { position: absolute; top: 0; left: 0; right: 0; }
+  .note {
+    position: absolute; left: 64%; width: 32%;
+    font-family: var(--note-font, "KaTeX_Main"), Georgia, serif;
+    font-size: calc(clamp(22px, 2.0vw, 32px) * var(--note-scale, 1));
+    font-weight: var(--note-weight, 400); font-style: var(--note-style, italic);
+    line-height: 1.18;
+    color: var(--note-ink);
+    transform: rotate(-0.6deg);
+    transition: top 0.45s ease;
+    padding-left: 0.9rem;
+  }
+  .note:nth-child(even) { transform: rotate(0.45deg); }
+  .note .lead {
+    display: block; font-size: 62%; font-weight: 500;
+    color: var(--note-ink-soft); margin-bottom: 0.1em;
+  }
+  .note .w { display: inline-block; opacity: 0; margin-right: 0.26em; }
+  .note .w.ink { animation: ink 0.30s ease-out forwards; }
+  .note .w.now { opacity: 1; }             /* replayed notes: no re-drawing */
+  @keyframes ink {
+    from { opacity: 1; clip-path: inset(0 100% -12% 0); }
+    to   { opacity: 1; clip-path: inset(0 -8% -12% 0); }
+  }
+  .note .pen { opacity: 0.8; font-size: 70%; }
+  .note .katex { font-size: 0.82em; }      /* KaTeX next to cursive runs large */
+  .note.scribble {
+    color: var(--pencil); font-weight: 500; font-size: clamp(17px, 1.4vw, 22px);
+  }
+  /* while Marginalia thinks: a hovering pencil at the freshest line */
+  #pencil {
+    position: absolute; left: 64%; padding-left: 0.9rem;
+    font-size: 1.5rem; color: var(--pencil);
+    animation: hover 1.6s ease-in-out infinite; display: none;
+    transition: top 0.45s ease;
+  }
+  #pencil.on { display: block; }
+  @keyframes hover {
+    0%, 100% { opacity: 0.25; } 50% { opacity: 0.85; }
+  }
+
+  /* grading (?grade / ?ops): pencil marks under the note */
+  .gradebtns { display: block; margin-top: 0.15em;
+               font: 0.85rem system-ui, sans-serif; }
+  .gradebtns button {
+    background: none; border: 1px solid #d8cdb4; color: var(--pencil);
+    border-radius: 6px; padding: 0.1em 0.45em; cursor: pointer; margin-right: 0.3em;
+  }
+  .gradebtns button.picked { border-color: var(--note-ink-soft); }
+  .gradebtns button:disabled { cursor: default; }
+  .tally { font-size: 0.72rem; color: #7d9a6e; margin-left: 0.2em; }
+  .gradenote {
+    background: none; border: none; border-bottom: 1px solid #d8cdb4;
+    color: #4a4336; font: 0.8rem system-ui, sans-serif;
+    padding: 0.15em 0.2em; width: 85%;
+  }
+  .gradenote::placeholder { color: #b8ad97; }
+  .noted { color: #7d9a6e; font: 0.75rem system-ui, sans-serif; }
+
+  #texttoggle {
+    position: fixed; left: 1rem; bottom: 1rem; z-index: 3;
+    background: none; border: 1px solid #d8cdb4; color: var(--pencil);
+    border-radius: 6px; font: 0.72rem system-ui, sans-serif;
+    padding: 0.3em 0.7em; cursor: pointer;
+  }
+  #qr {
+    position: fixed; right: 1rem; bottom: 1rem; z-index: 3; text-align: center;
+    font: 0.62rem/1.5 system-ui, sans-serif; color: var(--pencil);
+  }
+  #qr img { width: 84px; height: 84px; background: #fff; padding: 4px;
+            border-radius: 4px; display: block; margin: 0 auto 0.2rem;
+            border: 1px solid #d8cdb4; }
+  #qr[hidden] { display: none; }
+
+  /* phones: single column, notes fall in-flow under their paragraph zone */
+  @media (max-width: 760px) {
+    #text { width: 88%; margin-left: 6%; }
+    .note, #pencil { left: 10%; width: 82%; position: relative; margin: 0.5rem 0; }
+    #notes { position: static; }
+    .note { top: auto !important; }
+  }
+</style>
+</head>
+<body>
+  <div id="status">connecting…</div>
+  <div id="book">
+    <div id="text"></div>
+    <div id="notes"></div>
+    <div id="pencil">✎</div>
+  </div>
+  <button id="texttoggle" title="also: press t">¶ text</button>
+  <div id="qr" hidden><img src="/qr.svg" alt=""><span id="qr-url"></span></div>
+<script>
+  const params  = new URLSearchParams(location.search);
+  const gradeOn = params.has("grade") || params.has("ops");
+  const status  = document.getElementById("status");
+  const textEl  = document.getElementById("text");
+  const notesEl = document.getElementById("notes");
+  const bookEl  = document.getElementById("book");
+  const pencil  = document.getElementById("pencil");
+  let crashed = false;
+
+  function setStatus(text) {
+    status.textContent = text;
+    crashed = text.includes("crashed");
+    status.classList.toggle("crashed", crashed);
+    status.classList.toggle("thinking", !crashed && text.startsWith("thinking"));
+    status.classList.toggle("live", !crashed && !text.startsWith("thinking"));
+  }
+
+  // SSE replay can beat the deferred KaTeX CDN scripts: queue anything that
+  // arrives too early and re-render it once KaTeX is in
+  const katexPending = new Set();
+  function katexify(el) {
+    if (typeof renderMathInElement === "undefined") { katexPending.add(el); return; }
+    renderMathInElement(el, {
+      delimiters: [
+        { left: "$$", right: "$$", display: true },
+        { left: "$", right: "$", display: false },
+        { left: "\\(", right: "\\)", display: false },
+        { left: "\\[", right: "\\]", display: true },
+      ],
+      throwOnError: false,
+    });
+  }
+
+  // ---- the body text: transcript as textbook paragraphs, word-addressable ----
+  const words = [];        // [{n: normalized, el: span}] over the whole session
+  let para = null, paraWho = null, paraWords = 0;
+  const norm = (w) => w.toLowerCase().replace(/[^a-z0-9']+/g, "");
+
+  function appendTranscript(text) {
+    const m = text.match(/^(LECTURER|AUDIENCE-\d+|SPEAKER): (.*)$/s);
+    const who = m ? m[1] : paraWho;
+    const body = m ? m[2] : text;
+    if (!para || who !== paraWho || paraWords > 90) {
+      para = document.createElement("p");
+      para.className = "para";
+      if (who) {
+        const label = document.createElement("span");
+        label.className = "label" + (who.startsWith("AUDIENCE") ? " audience" : "");
+        label.textContent = who;
+        para.append(label);
+      }
+      textEl.append(para);
+      paraWho = who; paraWords = 0;
+    }
+    for (const raw of body.split(/\s+/)) {
+      if (!raw) continue;
+      const span = document.createElement("span");
+      span.className = "w";
+      span.textContent = raw + " ";
+      para.append(span);
+      words.push({ n: norm(raw), el: span });
+      paraWords++;
+    }
+    layout();
+  }
+
+  // find the most recent occurrence of the quoted word sequence; tolerate one
+  // ASR-mangled word at either end
+  function findAnchor(quote) {
+    const seq = quote.split(/\s+/).map(norm).filter(Boolean);
+    const tries = [seq, seq.slice(1), seq.slice(0, -1), seq.slice(1, -1)];
+    for (const t of tries) {
+      if (t.length < 2 && seq.length >= 2) continue;
+      if (!t.length) continue;
+      for (let i = words.length - t.length; i >= 0; i--) {
+        let ok = true;
+        for (let j = 0; j < t.length; j++)
+          if (words[i + j].n !== t[j]) { ok = false; break; }
+        if (ok) return words.slice(i, i + t.length).map(w => w.el);
+      }
+    }
+    return null;
+  }
+
+  // ---- margin notes ----
+  const noteRegistry = [];   // stacking order = creation order
+  let liveNote = null;       // the note currently being written
+
+  function splitComment(text) {
+    const lines = text.split("\n");
+    const quote = lines.filter(l => l.startsWith("> ")).map(l => l.slice(2)).join(" ");
+    const body  = lines.filter(l => !l.startsWith("> ")).join(" ").trim();
+    return { quote, body };
+  }
+
+  function anchorY(els) {
+    if (!els || !els.length) {
+      const last = words[words.length - 1];
+      return last ? last.el.offsetTop : 0;
+    }
+    return els[0].offsetTop;
+  }
+
+  function makeNote(id, cls) {
+    const el = document.createElement("div");
+    el.className = "note" + (cls ? " " + cls : "");
+    const body = document.createElement("span");
+    el.append(body);
+    notesEl.append(el);
+    const note = { id, el, bodyEl: body, anchorEls: null, y: 0, rendered: 0 };
+    el.addEventListener("mouseenter", () =>
+      (note.anchorEls || []).forEach(a => a.classList.add("hot")));
+    el.addEventListener("mouseleave", () =>
+      (note.anchorEls || []).forEach(a => a.classList.remove("hot")));
+    noteRegistry.push(note);
+    return note;
+  }
+
+  function anchorNote(note, quote) {
+    note.anchorEls = findAnchor(quote);
+    if (note.anchorEls) note.anchorEls.forEach(a => a.classList.add("anch"));
+    else if (quote) {
+      // quote didn't match the transcript (ASR drift): show it in the margin
+      const lead = document.createElement("span");
+      lead.className = "lead"; lead.textContent = "“" + quote + "”";
+      note.el.prepend(lead);
+    }
+    note.y = anchorY(note.anchorEls);
+  }
+
+  // split the body into word tokens, keeping $...$ math runs whole so KaTeX
+  // sees intact delimiters; an unclosed run is withheld until its closing $
+  function tokenize(body, final) {
+    const out = [];
+    let buf = null;
+    for (const p of body.split(/\s+/).filter(Boolean)) {
+      const odd = ((p.match(/\$/g) || []).length) % 2 === 1;
+      if (buf === null) {
+        if (odd) buf = p; else out.push(p);
+      } else {
+        buf += " " + p;
+        if (odd) { out.push(buf); buf = null; }
+      }
+    }
+    if (final && buf !== null) out.push(buf);
+    return out;
+  }
+
+  // append body words with the ink-wipe reveal; animate=false for replays
+  function writeWords(note, body, animate, holdLast) {
+    const parts = tokenize(body, !holdLast);
+    const upto = holdLast ? parts.length - 1 : parts.length;  // last word may be mid-stream
+    for (; note.rendered < upto; note.rendered++) {
+      const w = document.createElement("span");
+      w.className = "w " + (animate ? "ink" : "now");
+      w.textContent = parts[note.rendered];
+      note.bodyEl.append(w);
+      if (parts[note.rendered].includes("$")) katexify(w);
+    }
+  }
+
+  function finishNote(note, comment) {
+    note.bodyEl.querySelector(".pen")?.remove();
+    writeWords(note, splitComment(comment.text).body, true, false);
+    katexify(note.bodyEl);
+    if (gradeOn && comment.id != null) note.el.append(gradeButtons(comment.id, comment));
+    layout();
+  }
+
+  // ---- stacking: notes sit at their anchor, pushed down past earlier notes ----
+  function layout() {
+    let y = 0;
+    for (const n of noteRegistry) {
+      const top = Math.max(n.y, y);
+      n.el.style.top = top + "px";
+      y = top + n.el.offsetHeight + 14;
+    }
+    pencil.style.top = Math.max(anchorY(null), y) + "px";
+    bookEl.style.minHeight = Math.max(textEl.offsetHeight, y) + 300 + "px";
+    if (pinned) window.scrollTo({ top: document.body.scrollHeight });
+  }
+  // webfonts (and font cycling) change note heights after they were measured
+  document.fonts.addEventListener("loadingdone", () => layout());
+  document.fonts.ready.then(() => layout());
+  let pinned = true;
+  window.addEventListener("scroll", () => {
+    pinned = window.innerHeight + window.scrollY > document.body.scrollHeight - 160;
+  });
+  window.addEventListener("resize", () => {
+    for (const n of noteRegistry) n.y = anchorY(n.anchorEls);
+    layout();
+  });
+
+  function gradeButtons(id, counts) {
+    const span = document.createElement("span");
+    span.className = "gradebtns";
+    [["👍", "up"], ["👎", "down"]].forEach(([face, grade]) => {
+      const b = document.createElement("button");
+      b.textContent = face;
+      const n = document.createElement("span");
+      n.className = "tally"; n.dataset.id = id; n.dataset.g = grade;
+      n.textContent = counts && counts[grade] ? counts[grade] : "";
+      b.append(n);
+      b.addEventListener("click", (e) => {
+        e.stopPropagation();
+        fetch("/grade", { method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ id, grade }) });
+        span.querySelectorAll("button").forEach(x => { x.disabled = true; });
+        b.classList.add("picked");
+        const input = document.createElement("input");
+        input.className = "gradenote";
+        input.placeholder = "why? (only Marginalia sees this)";
+        input.maxLength = 300;
+        input.addEventListener("keydown", (k) => {
+          if (k.key !== "Enter" || !input.value.trim()) return;
+          fetch("/grade_note", { method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ id, grade, note: input.value.trim() }) });
+          const ok = document.createElement("span");
+          ok.className = "noted"; ok.textContent = "noted ✓";
+          input.replaceWith(ok);
+        });
+        span.append(input);
+        input.focus();
+        layout();
+      });
+      span.append(b);
+    });
+    return span;
+  }
+
+  // ---- events ----
+  const es = new EventSource("/events");
+  es.onopen  = () => setStatus("live");
+  es.onerror = () => { if (!crashed) setStatus("reconnecting…"); };
+
+  es.onmessage = (m) => {
+    const ev = JSON.parse(m.data);
+    if (ev.type === "transcript") {
+      appendTranscript(ev.text);
+    } else if (ev.type === "comment") {              // replay for late joiners
+      const note = makeNote(ev.id);
+      const { quote, body } = splitComment(ev.text);
+      anchorNote(note, quote);
+      writeWords(note, body, false, false);
+      katexify(note.bodyEl);
+      if (gradeOn) note.el.append(gradeButtons(ev.id, ev));
+      layout();
+    } else if (ev.type === "comment_start") {
+      pencil.classList.remove("on");
+      liveNote = makeNote(ev.id);
+      liveNote.pen = document.createElement("span");
+      liveNote.pen.className = "w now pen"; liveNote.pen.textContent = "✎";
+    } else if (ev.type === "comment_delta" && liveNote) {
+      const { quote, body } = splitComment(ev.text);
+      if (!liveNote.anchorEls && !liveNote.anchoredOnce && body) {
+        anchorNote(liveNote, quote);
+        liveNote.anchoredOnce = true;
+      }
+      if (body) {
+        liveNote.pen.remove();
+        writeWords(liveNote, body, true, true);
+        liveNote.bodyEl.append(liveNote.pen);
+        layout();
+      }
+    } else if (ev.type === "comment_done") {
+      const note = (liveNote && liveNote.id === ev.id) ? liveNote : makeNote(ev.id);
+      if (!note.anchoredOnce && !note.anchorEls)
+        anchorNote(note, splitComment(ev.text).quote);
+      finishNote(note, ev);
+      liveNote = null;
+    } else if (ev.type === "stage") {
+      if (!crashed) setStatus(ev.text === "listening" ? "live" : ev.text);
+      if (ev.text === "thinking…") { pencil.classList.add("on"); layout(); }
+    } else if (ev.type === "pass") {
+      pencil.classList.remove("on");
+    } else if (ev.type === "search_spawn") {
+      pencil.classList.remove("on");
+      const note = makeNote(null, "scribble");
+      note.y = anchorY(null);
+      note.bodyEl.textContent = "🔎 looking up: " + ev.text;
+      layout();
+    } else if (ev.type === "status") {
+      setStatus(ev.text);
+    } else if (ev.type === "grade") {
+      document.querySelectorAll(`.tally[data-id="${ev.id}"]`).forEach(t => {
+        const n = ev[t.dataset.g];
+        t.textContent = n ? n : "";
+      });
+    }
+  };
+
+  window.addEventListener("load", () => {
+    const pending = [...katexPending]; katexPending.clear();
+    pending.forEach(el => katexify(el));
+    if (pending.length) layout();
+  });
+
+  // ---- handwriting font: press f to cycle, ?font=Name or localStorage to pin ----
+  // 3b1b's actual font is CMU Serif italic (Computer Modern), which KaTeX's
+  // own fonts already provide — no extra download
+  const FONTS = [
+    { name: "CMU Serif italic (3b1b)", family: "KaTeX_Main", scale: 0.86, weight: 400, style: "italic" },
+    { name: "Caveat", family: "Caveat", scale: 1.0, weight: 600, style: "normal" },
+    { name: "Kalam", family: "Kalam", scale: 0.80, weight: 400, style: "normal" },
+    { name: "Shadows Into Light", family: "Shadows Into Light", scale: 0.95, weight: 400, style: "normal" },
+    { name: "Patrick Hand", family: "Patrick Hand", scale: 0.85, weight: 400, style: "normal" },
+    { name: "Nanum Pen Script", family: "Nanum Pen Script", scale: 1.05, weight: 400, style: "normal" },
+    { name: "Homemade Apple", family: "Homemade Apple", scale: 0.72, weight: 400, style: "normal" },
+  ];
+  let fontIdx = Math.max(0, FONTS.findIndex(f =>
+    f.name.toLowerCase() === (params.get("font") || localStorage.getItem("margin-font2") || "").toLowerCase()));
+  function applyFont(announce) {
+    const f = FONTS[fontIdx];
+    document.documentElement.style.setProperty("--note-font", `"${f.family}"`);
+    document.documentElement.style.setProperty("--note-scale", f.scale);
+    document.documentElement.style.setProperty("--note-weight", f.weight);
+    document.documentElement.style.setProperty("--note-style", f.style);
+    localStorage.setItem("margin-font2", f.name);
+    if (announce) {
+      let toast = document.getElementById("fonttoast");
+      if (!toast) {
+        toast = document.createElement("div");
+        toast.id = "fonttoast";
+        toast.style = "position:fixed;bottom:1rem;left:50%;transform:translateX(-50%);" +
+          "background:rgba(74,67,54,0.9);color:#f6f1e4;border-radius:8px;" +
+          "padding:0.4em 1em;font:0.85rem system-ui,sans-serif;z-index:4";
+        document.body.append(toast);
+      }
+      toast.textContent = f.name + "  (f to cycle)";
+      toast.style.display = "block";
+      clearTimeout(toast._t);
+      toast._t = setTimeout(() => { toast.style.display = "none"; }, 1800);
+    }
+    layout();
+  }
+  applyFont(false);
+
+  // ---- the transcript is scaffolding: fade it to a ghost with t (or button) ----
+  const toggleText = () => document.body.classList.toggle("ghost");
+  document.getElementById("texttoggle").addEventListener("click", toggleText);
+  document.addEventListener("keydown", (e) => {
+    if (e.target.matches("input")) return;
+    if (e.key === "t") toggleText();
+    if (e.key === "f") { fontIdx = (fontIdx + 1) % FONTS.length; applyFont(true); }
+  });
+
+  fetch("/meta").then(r => r.json()).then(meta => {
+    if (meta.url && !params.has("noqr")) {
+      document.getElementById("qr-url").textContent = meta.url.replace("http://", "");
+      document.getElementById("qr").hidden = false;
+    }
+  });
+</script>
+</body>
+</html>

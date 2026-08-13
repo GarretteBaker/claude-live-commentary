@@ -56,6 +56,17 @@ diarization yet, so paralinguistics are limited to nova-3's filler words.
 
 ## Views
 
+- **`/margin`** — the margin-notes experiment: the transcript rendered as
+  de-emphasized textbook body text (press `t` to fade it to a ghost), and
+  Marginalia's comments drawn live in the right margin, each anchored to the
+  quoted words (underlined in the text; hover a note to highlight its
+  anchor). Notes accumulate down the page like annotations in a used
+  textbook, so the room can read them asynchronously instead of racing the
+  lecture. A pencil ✎ hovers in the margin while a call is in flight; PASSes
+  are silent. Press `f` to cycle the note handwriting font (default: CMU
+  Serif italic, the 3b1b font; also `?font=Name`); `?grade` adds pencil-mark
+  vote buttons under each note. The commentator prompt leans into the same
+  framing: durable margin annotations, not reactions to the last sentence.
 - **http://localhost:8710** — projection page: the current comment large on
   the left, and the **full chat history** on the right (`?nofeed` hides it):
   the labeled transcript with Marginalia's comments backfilled in place, plus a
