@@ -4,12 +4,13 @@ MVP of Alexander's proposal (ILIAD intensive): a room conversation is recorded,
 transcribed live, and an LLM occasionally projects a short text comment onto a
 screen.
 
-Pipeline: mic (`parecord`) or recording (`ffmpeg`) → 16 kHz PCM → ASR →
-speaker labeling (the speaker with the most airtime is `LECTURER`, others are
-`AUDIENCE-n` — no enrollment needed) → at
+Pipeline: mic (`parecord`) or recording (`ffmpeg`) → 16 kHz PCM → ASR with
+speaker diarization (speakers keep anonymous letters `A:`, `B:`, `C:` — no
+role inference; Claude works out who's lecturing from behavior) → at
 each opportunity Claude sees the labeled rolling transcript + its previous
-comments and replies `PASS | reason` or one ≤25-word comment → FastAPI page
-(SSE) styled for projection.
+comments and replies `PASS | reason`, `SEARCH | query`, `ASK | question`
+(a clarification projected to the room in red — someone answers aloud), or
+one ≤25-word note → FastAPI page (SSE) styled for projection.
 
 Claude calls fire **continuously**: whenever any new words have arrived
 (`--min-new-words`, default 1) and `--call-gap` seconds (default 1) have
@@ -47,16 +48,25 @@ uv run app.py --mock                  # no API key, canned comments
 
 `--asr auto` (default) picks the best available backend by accuracy:
 **AssemblyAI Universal-3.5 Pro streaming** when `ASSEMBLYAI_API_KEY` is set
-(best-in-class streaming WER, live word-level speaker diarization up to 10
-speakers, formatted turns), else **Deepgram nova-3 streaming** when
-`DEEPGRAM_API_KEY` is set (faster/cheaper, a WER tier below; filler words),
-else **local faster-whisper** (~7 s chunks on the GPU, ECAPA-embedding
-speaker clustering, private, no cloud). Force one with
+(their current flagship — best-in-class streaming WER, live word-level
+speaker diarization up to 10 speakers, formatted turns), else **Deepgram
+nova-3 streaming** when `DEEPGRAM_API_KEY` is set (faster/cheaper, a WER
+tier below), else **local faster-whisper** (~7 s chunks on the GPU,
+ECAPA-embedding speaker clustering, private, no cloud). Force one with
 `--asr whisper|deepgram|assemblyai`. Cloud backends reconnect automatically
-on network blips. None of the streaming backends tag laughter/applause:
-ElevenLabs Scribe v2 has audio events + 48-speaker diarization but only in
-batch mode — the max-accuracy path would be Scribe batch over ~30 s trailing
-chunks (viable now that margin notes read asynchronously), not yet built.
+on network blips.
+
+The AssemblyAI path also takes `--keyterms names.txt` (one name/term per
+line, ≤100 used) — **keyterm prompting targets exactly the tokens Claude
+cannot repair from context** (proper nouns, technical vocabulary), which is
+where ASR errors actually cost commentary quality; the `--context` file's
+first 500 chars are also passed as a recognition scenario prompt. Pauses
+longer than 2.5 s become `[silence Ns]` transcript lines (pacing signal for
+Claude, a gap mark on the margin view). None of the streaming backends tag
+laughter/applause: ElevenLabs Scribe v2 has audio events + 48-speaker
+diarization but only in batch mode — the max-accuracy path would be Scribe
+batch over ~30 s trailing chunks (viable now that margin notes read
+asynchronously), not yet built.
 
 ## Views
 
@@ -66,8 +76,11 @@ chunks (viable now that margin notes read asynchronously), not yet built.
   quoted words (underlined in the text; hover a note to highlight its
   anchor). Notes accumulate down the page like annotations in a used
   textbook, so the room can read them asynchronously instead of racing the
-  lecture. A pencil ✎ hovers in the margin while a call is in flight; PASSes
-  are silent. Press `f` to cycle the note handwriting font (default: CMU
+  lecture. When notes come faster than the text grows, they shrink like an
+  annotator running out of room (and the prompt gets a margin-pressure
+  warning that raises the PASS bar at the source). Clarification questions
+  (`ASK |`) render in red pencil with a leading `?`. A pencil ✎ hovers in
+  the margin while a call is in flight; PASSes are silent. Press `f` to cycle the note handwriting font (default: CMU
   Serif italic, the 3b1b font; also `?font=Name`); `?grade` adds pencil-mark
   vote buttons under each note. The commentator prompt leans into the same
   framing: durable margin annotations, not reactions to the last sentence.
@@ -104,7 +117,8 @@ terminal; while a Claude call is in flight the corner shows *thinking…*.
 | flag | default | meaning |
 |---|---|---|
 | `--chattiness` | `strict` | `strict` / `chatty` / `eager`; retunable live from `/?ops` (`--chatty` = `chatty`) |
-| `--context` | — | text file (abstract, curriculum, notes) given to the commentator as background |
+| `--context` | — | text file (abstract, curriculum, notes) given to the commentator as background (and to AssemblyAI as a recognition prompt) |
+| `--keyterms` | — | file of names/terms (one per line) boosted in AssemblyAI recognition |
 | `--asr` | `auto` | `deepgram` (streaming diarization; needs `DEEPGRAM_API_KEY`) or local `whisper` |
 | `--whisper-model` | `distil-large-v3` | `small.en` is lighter; both fly on the GPU (~0.2–0.5 s / 7 s chunk, ≤2 GB VRAM) |
 | `--device` | `auto` | cuda when available (nvidia pip wheels; app re-execs once to set `LD_LIBRARY_PATH`) |

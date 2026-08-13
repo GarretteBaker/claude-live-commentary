@@ -50,7 +50,10 @@
     font: 600 0.68em system-ui, sans-serif; letter-spacing: 0.12em;
     text-transform: uppercase; color: var(--label-ink); margin-right: 0.7em;
   }
-  #text .label.audience { color: #ad8b56; }
+  #text .pausemark {
+    text-align: center; color: #c4bba8; font-size: 0.8em;
+    letter-spacing: 0.3em; margin: 0.4em 0;
+  }
   /* anchor words: the phrase a margin note points at */
   #text .w.anch {
     color: #4a4336;
@@ -90,6 +93,9 @@
   .note.scribble {
     color: var(--pencil); font-weight: 500; font-size: clamp(17px, 1.4vw, 22px);
   }
+  /* a question to the room: red pencil, leading ? */
+  .note.ask { color: #a03d2e; }
+  .note.ask::before { content: "?  "; font-weight: 700; }
   /* while Marginalia thinks: a hovering pencil at the freshest line */
   #pencil {
     position: absolute; left: 64%; padding-left: 0.9rem;
@@ -192,8 +198,24 @@
   let para = null, paraWho = null, paraWords = 0;
   const norm = (w) => w.toLowerCase().replace(/[^a-z0-9']+/g, "");
 
+  // stable color per anonymous speaker letter (muted for paper)
+  function whoColor(w) {
+    let h = 0;
+    for (const ch of w) h = (h * 31 + ch.charCodeAt(0)) % 360;
+    return `hsl(${h}, 35%, 42%)`;
+  }
+
   function appendTranscript(text) {
-    const m = text.match(/^(LECTURER|AUDIENCE-\d+|SPEAKER): (.*)$/s);
+    if (/^\[silence \d+s\]$/.test(text)) {   // long pauses render as a gap mark
+      const p = document.createElement("p");
+      p.className = "pausemark";
+      p.textContent = "· · ·  " + text.slice(9, -1);
+      textEl.append(p);
+      para = null;
+      layout();
+      return;
+    }
+    const m = text.match(/^([A-Z]+\d*(?:-\d+)?): (.*)$/s);
     const who = m ? m[1] : paraWho;
     const body = m ? m[2] : text;
     if (!para || who !== paraWho || paraWords > 90) {
@@ -201,7 +223,8 @@
       para.className = "para";
       if (who) {
         const label = document.createElement("span");
-        label.className = "label" + (who.startsWith("AUDIENCE") ? " audience" : "");
+        label.className = "label";
+        label.style.color = whoColor(who);
         label.textContent = who;
         para.append(label);
       }
@@ -325,7 +348,21 @@
 
   // ---- stacking: notes sit at their anchor, pushed down past earlier notes ----
   function layout() {
+    // pass 1: how far a note is pushed below its anchor decides its size —
+    // a crowded margin writes smaller, like a real annotator running out of
+    // room (this is what keeps dense commentary from outrunning the text)
     let y = 0;
+    for (const n of noteRegistry) {
+      if (!n.el.classList.contains("scribble")) {
+        const over = Math.max(0, y - n.y);
+        const s = Math.max(0.68, 1 - over / 1600);
+        n.el.style.fontSize =
+          `calc(clamp(22px, 2.0vw, 32px) * var(--note-scale, 1) * ${s.toFixed(3)})`;
+      }
+      y = Math.max(n.y, y) + n.el.offsetHeight + 14;
+    }
+    // pass 2: restack with the post-shrink heights
+    y = 0;
     for (const n of noteRegistry) {
       const top = Math.max(n.y, y);
       n.el.style.top = top + "px";
@@ -396,7 +433,7 @@
     if (ev.type === "transcript") {
       appendTranscript(ev.text);
     } else if (ev.type === "comment") {              // replay for late joiners
-      const note = makeNote(ev.id);
+      const note = makeNote(ev.id, ev.kind === "ask" ? "ask" : "");
       const { quote, body } = splitComment(ev.text);
       anchorNote(note, quote);
       writeWords(note, body, false, false);
@@ -421,7 +458,8 @@
         layout();
       }
     } else if (ev.type === "comment_done") {
-      const note = (liveNote && liveNote.id === ev.id) ? liveNote : makeNote(ev.id);
+      const note = (liveNote && liveNote.id === ev.id) ? liveNote
+                   : makeNote(ev.id, ev.kind === "ask" ? "ask" : "");
       if (!note.anchoredOnce && !note.anchorEls)
         anchorNote(note, splitComment(ev.text).quote);
       finishNote(note, ev);

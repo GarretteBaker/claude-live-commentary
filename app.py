@@ -35,7 +35,7 @@ BYTES_PER_SEC = SAMPLE_RATE * 2  # s16le mono
 COMMENTATOR_SYSTEM = """\
 You are Marginalia: you write notes in the margin of a live lecture transcript, the way a sharp reader annotates a textbook. The room sees the transcript as body text on a projected page; your notes appear handwritten in the margin, each one anchored to the words it responds to, which get underlined.
 You see a rolling speech-recognition transcript; it contains transcription errors — read through them and never comment on transcription quality.
-Lines carry heuristic speaker labels: LECTURER is the speaker with the most airtime, AUDIENCE-n are others. Labels can be wrong, especially early on or for short remarks — treat them as hints, useful for telling audience questions apart from the main thread.
+Lines carry anonymous speaker letters assigned by voice — "A:", "B:", "C:" (or "SPEAKER:" when attribution failed). The letters carry no roles: infer who is lecturing and who is asking from behavior. Attribution can be wrong, especially on short remarks and overlapping speech — treat letters as hints, and if the room uses names, map names to letters yourself. Lines like [silence 12s] mark long pauses.
 
 Margin notes are read asynchronously: people glance at the margin when they have a spare moment, sometimes minutes after you wrote. So never narrate the moment ("now she's arguing…") — write annotations of the argument that stay worth reading later.
 Each time you see the transcript, reply with either the single token PASS or one note.
@@ -66,6 +66,8 @@ Each transcript line is prefixed with the wall-clock time it was transcribed, e.
 The room can vote on your notes; previous notes may carry tallies like [2↑ 1↓] and private voter notes explaining the vote. The notes are visible only to you — never quote, mention, or respond to them on screen. Use them to calibrate what this audience values, and raise the PASS bar after downvotes.
 
 You always see the full session transcript. If the room explicitly asks you to search or look something up ("Marginalia, search for…", "chat, look up…"), reply exactly "SEARCH | <what to find>" instead of a note: a background web-search agent will look it up and its report will appear in your next turn under "Reports from your web-search agent". The room sees nothing while it runs, so deliver the answer as a note on a later turn using the report. Only search when explicitly asked to.
+
+If something blocks an otherwise-good note — a garbled term you can't recover, an unclear referent, suspected mis-attribution — you may reply "ASK | <question, at most 15 words>". It is projected to the room as a question from you, and someone may answer aloud (the answer reaches you through the transcript). Use it sparingly; never ask what you could infer from context.
 
 Most turns should be PASS. When you decline, reply "PASS | <ten-word reason>" so the operator can tune the system; the reason is never projected. Otherwise output only the note text (with its quote line) — no preamble or markdown. LaTeX math with $...$ or $$...$$ delimiters renders on the page; use it for formulas."""
 
@@ -253,9 +255,9 @@ def lan_ip() -> str:
 # ---------------------------------------------------------------- speakers
 
 class SpeakerLabeler:
-    """Greedy online clustering of ECAPA speaker embeddings. The cluster with
-    the most accumulated speech duration is the LECTURER; everyone else is
-    AUDIENCE-n. No enrollment needed - label semantics come from airtime."""
+    """Greedy online clustering of ECAPA speaker embeddings. Clusters get
+    anonymous letters A, B, C… in order of first appearance — no role
+    inference; Claude works out who's who from behavior."""
 
     SIM_THRESHOLD = 0.45   # cosine; far-field audio compresses the margin
     MIN_SEC = 0.8          # segments shorter than this inherit the last label
@@ -271,7 +273,7 @@ class SpeakerLabeler:
         )
         self._centroids: list[np.ndarray] = []   # unit vectors
         self._durations: list[float] = []        # accumulated speech per cluster
-        self._last = "LECTURER"
+        self._last = "A"
 
     def label(self, audio: np.ndarray, start: float, end: float) -> str:
         dur = end - start
@@ -296,9 +298,7 @@ class SpeakerLabeler:
             self._centroids[best] = c / np.linalg.norm(c)
             self._durations[best] += dur
 
-        lecturer = int(np.argmax(self._durations))
-        self._last = ("LECTURER" if best == lecturer
-                      else f"AUDIENCE-{best if best < lecturer else best - 1}")
+        self._last = chr(65 + best) if best < 26 else f"S{best}"
         return self._last
 
 
@@ -380,14 +380,10 @@ def deepgram_transcriber_thread(audio_q: queue.Queue, args):
     print("[deepgram] connected: nova-3, streaming diarization on")
     broadcaster.publish({"type": "status", "text": "listening"})
 
-    durations: dict[int, float] = {}  # speaker index -> accumulated airtime
-
     def label(spk) -> str:
         if spk is None:
             return "SPEAKER"
-        lecturer = max(durations, key=durations.get)
-        return ("LECTURER" if spk == lecturer
-                else f"AUDIENCE-{spk if spk < lecturer else spk - 1}")
+        return chr(65 + spk) if spk < 26 else f"S{spk}"
 
     def sender():
         while True:
@@ -406,7 +402,6 @@ def deepgram_transcriber_thread(audio_q: queue.Queue, args):
         lines: list[tuple[int | None, list[str]]] = []
         for w in words:
             spk = w.get("speaker")
-            durations[spk] = durations.get(spk, 0.0) + (w["end"] - w["start"])
             token = w.get("punctuated_word", w["word"])
             if lines and lines[-1][0] == spk:
                 lines[-1][1].append(token)
@@ -423,29 +418,28 @@ def deepgram_transcriber_thread(audio_q: queue.Queue, args):
 
 def assemblyai_transcriber_thread(audio_q: queue.Queue, args):
     """Streaming ASR via AssemblyAI Universal-3.5 Pro: best-in-class streaming
-    accuracy with live speaker diarization. Used when --asr assemblyai
-    (or auto + ASSEMBLYAI_API_KEY set)."""
+    accuracy with live speaker diarization. Speakers keep AssemblyAI's raw
+    letters (A, B, C…). Used when --asr assemblyai (or auto + key set)."""
+    import urllib.parse
     import websocket
 
-    params = ("speech_model=universal-3-5-pro&encoding=pcm_s16le"
-              "&sample_rate=16000&format_turns=true&speaker_labels=true")
+    params = {"speech_model": "universal-3-5-pro", "encoding": "pcm_s16le",
+              "sample_rate": "16000", "format_turns": "true",
+              "speaker_labels": "true"}
+    if args.keyterms:
+        terms = [t.strip() for t in Path(args.keyterms).read_text().splitlines()
+                 if t.strip()][:100]
+        params["keyterms_prompt"] = json.dumps(terms)
+        print(f"[assemblyai] boosting {len(terms)} keyterms")
+    if config["context"]:
+        # scenario context steers recognition toward the domain's vocabulary
+        params["prompt"] = config["context"][:500]
     ws = websocket.create_connection(
-        f"wss://streaming.assemblyai.com/v3/ws?{params}",
+        "wss://streaming.assemblyai.com/v3/ws?" + urllib.parse.urlencode(params),
         header=[f"Authorization: {os.environ['ASSEMBLYAI_API_KEY']}"],
     )
     print("[assemblyai] connected: universal-3-5-pro, streaming diarization on")
     broadcaster.publish({"type": "status", "text": "listening"})
-
-    durations: dict[str, float] = {}  # speaker letter -> accumulated airtime
-
-    def label(spk) -> str:
-        if spk in (None, "UNKNOWN"):
-            return "SPEAKER"
-        lecturer = max(durations, key=durations.get)
-        if spk == lecturer:
-            return "LECTURER"
-        others = sorted(k for k in durations if k != lecturer)
-        return f"AUDIENCE-{others.index(spk)}"
 
     def sender():
         while True:
@@ -453,6 +447,14 @@ def assemblyai_transcriber_thread(audio_q: queue.Queue, args):
 
     threading.Thread(target=sender, name="assemblyai-sender", daemon=True).start()
 
+    def emit(line: str):
+        transcript.append(f"[{time.strftime('%H:%M:%S')}] {line}")
+        print(f"[asr] {line}")
+        broadcaster.publish({"type": "transcript", "text": line,
+                             "ts": time.strftime("%H:%M:%S")})
+        session_log.log("transcript", text=line)
+
+    last_end_ms = None  # end of the previous turn's last word
     while True:
         msg = json.loads(ws.recv())
         # each turn arrives once more with formatting applied; emit only that
@@ -463,24 +465,23 @@ def assemblyai_transcriber_thread(audio_q: queue.Queue, args):
         words = msg.get("words", [])
         if not words:
             continue
+        # long pauses are informative (thinking, discomfort, topic boundary)
+        gap_ms = words[0]["start"] - last_end_ms if last_end_ms is not None else 0
+        if gap_ms > 2500:
+            emit(f"[silence {round(gap_ms / 1000)}s]")
+        last_end_ms = words[-1]["end"]
         # group consecutive words by speaker into lines (a turn is usually one
         # speaker, but word-level attribution catches quick interjections)
         lines: list[tuple[str | None, list[str]]] = []
         for w in words:
             spk = w.get("speaker")
-            if spk not in (None, "UNKNOWN"):
-                durations[spk] = durations.get(spk, 0.0) + (w["end"] - w["start"])
             if lines and lines[-1][0] == spk:
                 lines[-1][1].append(w["text"])
             else:
                 lines.append((spk, [w["text"]]))
         for spk, tokens in lines:
-            line = f"{label(spk)}: {' '.join(tokens)}"
-            transcript.append(f"[{time.strftime('%H:%M:%S')}] {line}")
-            print(f"[asr] {line}")
-            broadcaster.publish({"type": "transcript", "text": line,
-                                 "ts": time.strftime("%H:%M:%S")})
-            session_log.log("transcript", text=line)
+            who = "SPEAKER" if spk in (None, "UNKNOWN") else spk
+            emit(f"{who}: {' '.join(tokens)}")
 
 
 # ---------------------------------------------------------------- commentary
@@ -497,13 +498,24 @@ def build_user_content() -> list[dict]:
 
     def fmt(c: dict) -> str:
         tally = f"[{c['up']}↑ {c['down']}↓] " if c["up"] or c["down"] else ""
-        line = f"- {tally}{c['text']}"
+        ask = "[you asked] " if c.get("kind") == "ask" else ""
+        line = f"- {tally}{ask}{c['text']}"
         if c["notes"]:
             joined = "; ".join(f'({n["grade"]}) "{n["note"]}"' for n in c["notes"][-5:])
             line += f"\n  private voter notes: {joined}"
         return line
 
     prev = "\n".join(fmt(c) for c in comments[-10:]) or "(none)"
+    # margin backpressure: when notes come faster than the margin can absorb
+    # them, say so — the PASS bar rises at the source instead of the display
+    # drowning in ink
+    now = time.time()
+    recent = sum(1 for c in comments[-12:]
+                 if now - time.mktime(time.strptime(
+                     time.strftime("%Y-%m-%d ") + c["ts"], "%Y-%m-%d %H:%M:%S")) < 120)
+    pressure = (f"You have already written {recent} notes in the last two minutes; "
+                "the margin is crowded. PASS unless a note would be exceptional.\n\n"
+                if recent >= 4 else "")
     reports = "\n".join(
         f"- [{r['ts']}] you asked \"{r['query']}\" → {r['report']}"
         for r in search_reports[-3:])
@@ -524,8 +536,8 @@ def build_user_content() -> list[dict]:
                             + ("\n".join(tail_lines) if tail_lines else "(nothing yet)")
                             + "\n")})
     blocks.append({"type": "text",
-                   "text": (f"\nYour previous comments:\n{prev}\n\n{reports_block}"
-                            f"Reply with PASS, SEARCH | <query>, or one comment.")})
+                   "text": (f"\nYour previous comments:\n{prev}\n\n{reports_block}{pressure}"
+                            f"Reply with PASS, SEARCH | <query>, ASK | <question>, or one note.")})
     return blocks
 
 
@@ -604,9 +616,11 @@ def stream_claude(client, args, comment_id: int) -> tuple[str, float | None]:
         for delta in stream.text_stream:
             text += delta
             clean = text.lstrip()
-            # withhold until we can rule out PASS and SEARCH — neither displays
+            # withhold until we can rule out PASS, SEARCH and ASK — none of
+            # these stream to the screen (ASK lands whole via comment_done)
             if (len(clean) < 7 or clean[:4].upper() == "PASS"
-                    or clean[:6].upper() == "SEARCH"):
+                    or clean[:6].upper() == "SEARCH"
+                    or clean[:5].upper() == "ASK |" or clean[:4].upper() == "ASK|"):
                 continue
             if first is None:
                 first = time.monotonic() - t0
@@ -703,14 +717,20 @@ def commentator_thread(args):
                                  "ts": time.strftime("%H:%M:%S"), "dt": round(dt, 1)})
             session_log.log("pass", reason=reason, dt=round(dt, 1))
             continue
-        comment = {"id": comment_id, "text": reply,
+        # "ASK | q" projects a clarification question; the room answers aloud
+        # and the answer reaches Claude through the transcript
+        kind = "note"
+        if re.match(r"ASK\s*\|", reply.strip(), re.IGNORECASE):
+            kind = "ask"
+            reply = reply.split("|", 1)[1].strip()
+        comment = {"id": comment_id, "text": reply, "kind": kind,
                    "ts": time.strftime("%H:%M:%S"),
                    "up": 0, "down": 0, "notes": [],
                    "context": transcript.text()[-1500:]}
         comments.append(comment)
         broadcaster.publish({"type": "comment_done", "id": comment["id"],
-                             "text": comment["text"], "ts": comment["ts"],
-                             "dt": round(dt, 1)})
+                             "text": comment["text"], "kind": kind,
+                             "ts": comment["ts"], "dt": round(dt, 1)})
         session_log.log("comment", id=comment["id"], text=comment["text"],
                         ttfw=round(ttfw, 1) if ttfw is not None else None,
                         dt=round(dt, 1))
@@ -881,6 +901,7 @@ def make_app(args) -> FastAPI:
             for c in comments[-8:]:
                 replay.append((c["ts"], {"type": "comment", "id": c["id"],
                                          "text": c["text"], "ts": c["ts"],
+                                         "kind": c.get("kind", "note"),
                                          "up": c["up"], "down": c["down"]}))
             for _ts, ev in sorted(replay, key=lambda p: p[0]):
                 yield f"data: {json.dumps(ev)}\n\n"
@@ -925,6 +946,10 @@ def main():
                    help="shorthand for --chattiness chatty")
     p.add_argument("--context", metavar="FILE",
                    help="text file with background for the commentator (abstract, curriculum, notes)")
+    p.add_argument("--keyterms", metavar="FILE",
+                   help="file with one name/term per line (≤100 used, ≤50 chars each) — "
+                        "boosted in AssemblyAI recognition; the tokens Claude can't "
+                        "repair from context are exactly the ones worth listing")
     p.add_argument("--call-gap", type=float, default=1.0,
                    help="min seconds between Claude calls (calls never overlap, so the "
                         "effective cadence during speech is bounded by API latency)")

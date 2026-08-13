@@ -132,6 +132,8 @@
   }
   #feed .msg.muse .who { font: 600 0.72rem system-ui, sans-serif;
     font-style: normal; color: #6faf7a; letter-spacing: 0.06em; display: block; }
+  #feed .msg.muse.ask { border-left-color: #c9a45a; }
+  #feed .msg.muse.ask .who { color: #c9a45a; }
   body.feed #ticker { display: none; }  /* the feed supersedes the ticker */
   /* --- QR corner: phones in the room scan to follow along --- */
   #qr {
@@ -268,6 +270,13 @@
     return span;
   }
 
+  // stable color per anonymous speaker letter
+  function whoColor(w) {
+    let h = 0;
+    for (const ch of w) h = (h * 31 + ch.charCodeAt(0)) % 360;
+    return `hsl(${h}, 45%, 65%)`;
+  }
+
   function renderInto(el, comment, withTs) {
     el.innerHTML = "";
     const { quote, body } = splitComment(comment.text);
@@ -276,7 +285,8 @@
       q.className = "quote"; q.textContent = "“" + quote + "”";
       el.append(q);
     }
-    el.append(document.createTextNode(body));
+    el.append(document.createTextNode(
+      (comment.kind === "ask" ? "❓ " : "") + body));
     if (gradeOn && comment.id != null)
       el.append(gradeButtons(comment.id, { up: comment.up, down: comment.down }));
     if (withTs && comment.ts) {
@@ -305,11 +315,12 @@
   function feedMessage(ev) {
     const d = document.createElement("div");
     d.className = "msg";
-    const m = ev.text.match(/^(LECTURER|AUDIENCE-\d+|SPEAKER): (.*)$/s);
+    const m = ev.text.match(/^([A-Z]+\d*(?:-\d+)?): (.*)$/s);
     if (m) {
       if (m[1] !== feedLastWho) {
         const who = document.createElement("span");
-        who.className = "who" + (m[1].startsWith("AUDIENCE") ? " audience" : "");
+        who.className = "who";
+        who.style.color = whoColor(m[1]);
         who.textContent = m[1] + " ";
         d.append(who);
       }
@@ -332,7 +343,7 @@
   // so the feed is the full conversation history
   function feedComment(c) {
     const d = document.createElement("div");
-    d.className = "msg muse";
+    d.className = "msg muse" + (c.kind === "ask" ? " ask" : "");
     const who = document.createElement("span");
     who.className = "who";
     who.textContent = "MARGINALIA" + (c.ts ? " · " + c.ts : "");
