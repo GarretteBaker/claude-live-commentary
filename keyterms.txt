@@ -7,6 +7,53 @@
 claude
 Marginalia
 
+# --- SLT / event-core vocabulary ---
+RLCT
+singular learning theory
+local learning coefficient
+SGLD
+devinterp
+Watanabe
+Timaeus
+Iliad
+epsilon-machine
+computational mechanics
+mixed state presentation
+belief state geometry
+GHMM
+natural latents
+grokking
+
+# --- agenda jargon ASR will butcher ---
+infra-Bayesianism
+Löb's theorem
+logical induction
+tiling agents
+AIXI
+Solomonoff induction
+Kolmogorov complexity
+mesa-optimization
+corrigibility
+Eliciting Latent Knowledge
+heuristic arguments
+factored cognition
+Prover-Estimator Debate
+Marcus Hutter
+sparse autoencoders
+induction heads
+residual stream
+mechanistic interpretability
+attribution-based parameter decomposition
+Partial Information Decomposition
+Platonic Representation Hypothesis
+safe Pareto improvements
+malign universal prior
+alignment faking
+goal misgeneralisation
+instrumental convergence
+scalable oversight
+iterated distillation and amplification
+
 # --- people in the room (slides roster + mega-doc) ---
 Garrett Baker
 Alexander Gietelink Oldenziel
@@ -74,54 +121,9 @@ Trinidad Borrell
 Vincent Tran
 Will Lancer
 
-# --- SLT / event-core vocabulary ---
-RLCT
-singular learning theory
-local learning coefficient
-SGLD
-devinterp
-Watanabe
-Timaeus
-Iliad
-epsilon-machine
-computational mechanics
-mixed state presentation
-belief state geometry
-GHMM
-natural latents
-grokking
-
-# --- agenda jargon ASR will butcher ---
-infra-Bayesianism
-Löb's theorem
-logical induction
-tiling agents
-AIXI
-Solomonoff induction
-Kolmogorov complexity
-mesa-optimization
-corrigibility
-Eliciting Latent Knowledge
-heuristic arguments
-factored cognition
-Prover-Estimator Debate
-Marcus Hutter
-sparse autoencoders
-induction heads
-residual stream
-mechanistic interpretability
-attribution-based parameter decomposition
-Partial Information Decomposition
-Platonic Representation Hypothesis
-safe Pareto improvements
-malign universal prior
-alignment faking
-goal misgeneralisation
-instrumental convergence
-scalable oversight
-iterated distillation and amplification
-
-# ================= below the 100-term cut =================
+# ============ explicitly deprioritized ============
+# (the 100-cap is counted from the top and may already have been
+#  reached above this line — the startup log prints the number used)
 # (kept for reference / future swaps; famous enough that ASR+Claude
 # usually recover them)
 Coherent Extrapolated Volition
