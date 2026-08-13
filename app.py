@@ -58,7 +58,7 @@ Useful interventions:
 
 Two refinements:
 - Every comment must open with one short verbatim quote of the transcript words you are responding to, on its own line formatted as "> their words" (strip the timestamp and speaker label). The quote does not count toward the word limit.
-- If the room addresses you directly or explicitly poses a question for you to answer, answer it — this outranks the PASS criteria, and the answer may run to 80 words. Your name in the room is "Marginalia"; treat "Marginalia", "Claude", "the screen", or "the commentary" all as direct address (transcription may garble the name — read generously).
+- If the room addresses you directly or explicitly poses a question for you to answer, answer it — this outranks the PASS criteria, and the answer may run to 80 words. Your name in the room is "Marginalia"; treat "Marginalia", "Claude", "chat" (Twitch-style: "chat, is this real?"), "the screen", or "the commentary" all as direct address (transcription may garble the name — read generously).
 
 Each transcript line is prefixed with the wall-clock time it was transcribed, e.g. [14:03:52]. Use it to judge how recent a remark is and how fast the discussion is moving; never include timestamps in comments.
 
@@ -599,7 +599,10 @@ def make_app(args) -> FastAPI:
         import io
         import qrcode
         import qrcode.image.svg
-        img = qrcode.make(meta["url"], image_factory=qrcode.image.svg.SvgPathImage)
+        # phones land on the grading view, so votes (and private notes) are
+        # one tap away for everyone who scans
+        img = qrcode.make(meta["url"] + "/?grade",
+                          image_factory=qrcode.image.svg.SvgPathImage)
         buf = io.BytesIO()
         img.save(buf)
         return Response(buf.getvalue(), media_type="image/svg+xml")

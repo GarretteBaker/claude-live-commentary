@@ -53,7 +53,8 @@ uv run app.py --mock                  # no API key, canned comments
   `commented` or `pass · reason` — the room can see exactly what it is
   thinking about. Late joiners get the recent conversation replayed in
   order. A QR code in the corner (hide with `/?noqr`) points phones at the
-  LAN address, also printed at startup.
+  LAN address's `/?grade` view, so scanners can vote immediately; the URL is
+  also printed at startup.
 - **On phones** the same page becomes a scrollable chat feed (current comment
   on top, full conversation below); add `?grade` for grading buttons.
 - **`/?chime`** — adds a soft two-note chime on each comment (click the page
