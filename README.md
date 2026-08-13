@@ -45,14 +45,18 @@ uv run app.py --mock                  # no API key, canned comments
 
 ## ASR backends
 
-`--asr auto` (default) picks **Deepgram nova-3 streaming** when
-`DEEPGRAM_API_KEY` is set — true streaming with word-level diarization, smart
-formatting, and filler words — and otherwise falls back to **local
-faster-whisper** (~7 s chunks on the GPU, ECAPA-embedding speaker clustering,
-private, no cloud). Force either with `--asr whisper` / `--asr deepgram`.
-Deepgram reconnects automatically on network blips. Neither backend tags
-laughter/applause; ElevenLabs Scribe has audio events but no streaming
-diarization yet, so paralinguistics are limited to nova-3's filler words.
+`--asr auto` (default) picks the best available backend by accuracy:
+**AssemblyAI Universal-3.5 Pro streaming** when `ASSEMBLYAI_API_KEY` is set
+(best-in-class streaming WER, live word-level speaker diarization up to 10
+speakers, formatted turns), else **Deepgram nova-3 streaming** when
+`DEEPGRAM_API_KEY` is set (faster/cheaper, a WER tier below; filler words),
+else **local faster-whisper** (~7 s chunks on the GPU, ECAPA-embedding
+speaker clustering, private, no cloud). Force one with
+`--asr whisper|deepgram|assemblyai`. Cloud backends reconnect automatically
+on network blips. None of the streaming backends tag laughter/applause:
+ElevenLabs Scribe v2 has audio events + 48-speaker diarization but only in
+batch mode — the max-accuracy path would be Scribe batch over ~30 s trailing
+chunks (viable now that margin notes read asynchronously), not yet built.
 
 ## Views
 

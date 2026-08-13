@@ -421,6 +421,68 @@ def deepgram_transcriber_thread(audio_q: queue.Queue, args):
             session_log.log("transcript", text=line)
 
 
+def assemblyai_transcriber_thread(audio_q: queue.Queue, args):
+    """Streaming ASR via AssemblyAI Universal-3.5 Pro: best-in-class streaming
+    accuracy with live speaker diarization. Used when --asr assemblyai
+    (or auto + ASSEMBLYAI_API_KEY set)."""
+    import websocket
+
+    params = ("speech_model=universal-3-5-pro&encoding=pcm_s16le"
+              "&sample_rate=16000&format_turns=true&speaker_labels=true")
+    ws = websocket.create_connection(
+        f"wss://streaming.assemblyai.com/v3/ws?{params}",
+        header=[f"Authorization: {os.environ['ASSEMBLYAI_API_KEY']}"],
+    )
+    print("[assemblyai] connected: universal-3-5-pro, streaming diarization on")
+    broadcaster.publish({"type": "status", "text": "listening"})
+
+    durations: dict[str, float] = {}  # speaker letter -> accumulated airtime
+
+    def label(spk) -> str:
+        if spk in (None, "UNKNOWN"):
+            return "SPEAKER"
+        lecturer = max(durations, key=durations.get)
+        if spk == lecturer:
+            return "LECTURER"
+        others = sorted(k for k in durations if k != lecturer)
+        return f"AUDIENCE-{others.index(spk)}"
+
+    def sender():
+        while True:
+            ws.send_binary(audio_q.get())
+
+    threading.Thread(target=sender, name="assemblyai-sender", daemon=True).start()
+
+    while True:
+        msg = json.loads(ws.recv())
+        # each turn arrives once more with formatting applied; emit only that
+        # final version so lines never duplicate
+        if msg.get("type") != "Turn" or not msg.get("end_of_turn") \
+                or not msg.get("turn_is_formatted"):
+            continue
+        words = msg.get("words", [])
+        if not words:
+            continue
+        # group consecutive words by speaker into lines (a turn is usually one
+        # speaker, but word-level attribution catches quick interjections)
+        lines: list[tuple[str | None, list[str]]] = []
+        for w in words:
+            spk = w.get("speaker")
+            if spk not in (None, "UNKNOWN"):
+                durations[spk] = durations.get(spk, 0.0) + (w["end"] - w["start"])
+            if lines and lines[-1][0] == spk:
+                lines[-1][1].append(w["text"])
+            else:
+                lines.append((spk, [w["text"]]))
+        for spk, tokens in lines:
+            line = f"{label(spk)}: {' '.join(tokens)}"
+            transcript.append(f"[{time.strftime('%H:%M:%S')}] {line}")
+            print(f"[asr] {line}")
+            broadcaster.publish({"type": "transcript", "text": line,
+                                 "ts": time.strftime("%H:%M:%S")})
+            session_log.log("transcript", text=line)
+
+
 # ---------------------------------------------------------------- commentary
 
 TRANSCRIPT_CHUNK = 40  # lines per immutable cache block
@@ -605,7 +667,7 @@ def commentator_thread(args):
 
         # pull the partially-filled audio chunk through whisper first, so
         # Claude sees the freshest words rather than a chunk-boundary-stale
-        # view (deepgram streams continuously; nothing to flush)
+        # view (cloud ASR streams continuously; nothing to flush)
         if args.asr == "whisper":
             flush_done.clear()
             flush_req.set()
@@ -676,8 +738,9 @@ def make_app(args) -> FastAPI:
                 audio_q.put(b)
             print("[audio] stream ended")
 
-        transcriber = (deepgram_transcriber_thread if args.asr == "deepgram"
-                       else transcriber_thread)
+        transcriber = {"deepgram": deepgram_transcriber_thread,
+                       "assemblyai": assemblyai_transcriber_thread,
+                       }.get(args.asr, transcriber_thread)
         targets = {
             "audio": reader,
             "transcriber": lambda: transcriber(audio_q, args),
@@ -706,10 +769,10 @@ def make_app(args) -> FastAPI:
                       "rerun without --fast", flush=True)
                 broadcaster.publish({"type": "status",
                                      "text": "commentator crashed — see terminal"})
-            elif exc.thread.name == "transcriber" and args.asr == "deepgram" and (
+            elif exc.thread.name == "transcriber" and args.asr in ("deepgram", "assemblyai") and (
                     issubclass(exc.exc_type, (OSError, ConnectionError))
                     or "WebSocket" in exc.exc_type.__name__):
-                print("[deepgram] connection lost — reconnecting in 5s", flush=True)
+                print(f"[{args.asr}] connection lost — reconnecting in 5s", flush=True)
                 broadcaster.publish({"type": "status", "text": "reconnecting ASR…"})
 
                 def relaunch_asr():
@@ -838,8 +901,10 @@ def main():
                    help="audio/video file or YouTube/etc. URL to simulate a live feed from (mic if omitted)")
     p.add_argument("--speed", type=float, default=1.0, help="playback speed for --wav")
     p.add_argument("--mock", action="store_true", help="canned comments instead of the Claude API")
-    p.add_argument("--asr", default="auto", choices=["auto", "whisper", "deepgram"],
-                   help="auto = deepgram streaming (nova-3, word-level diarization) when "
+    p.add_argument("--asr", default="auto",
+                   choices=["auto", "whisper", "deepgram", "assemblyai"],
+                   help="auto = assemblyai streaming (universal-3-5-pro, best accuracy) "
+                        "when ASSEMBLYAI_API_KEY is set, else deepgram when "
                         "DEEPGRAM_API_KEY is set, else local whisper")
     p.add_argument("--whisper-model", default="distil-large-v3",
                    help="faster-whisper model; small.en is a lighter fallback")
@@ -869,9 +934,13 @@ def main():
     args = p.parse_args()
 
     if args.asr == "auto":
-        args.asr = "deepgram" if os.environ.get("DEEPGRAM_API_KEY") else "whisper"
-    if args.asr == "deepgram" and not os.environ.get("DEEPGRAM_API_KEY"):
-        sys.exit("--asr deepgram needs DEEPGRAM_API_KEY in the environment")
+        args.asr = ("assemblyai" if os.environ.get("ASSEMBLYAI_API_KEY")
+                    else "deepgram" if os.environ.get("DEEPGRAM_API_KEY")
+                    else "whisper")
+    for backend, envvar in (("deepgram", "DEEPGRAM_API_KEY"),
+                            ("assemblyai", "ASSEMBLYAI_API_KEY")):
+        if args.asr == backend and not os.environ.get(envvar):
+            sys.exit(f"--asr {backend} needs {envvar} in the environment")
     ensure_cuda_libs()
     args.device = resolve_device(args.device)
     config["chattiness"] = "chatty" if args.chatty and args.chattiness == "strict" else args.chattiness
@@ -885,8 +954,9 @@ def main():
     print(f"[app] display:  http://localhost:{args.port}  (project this)")
     print(f"[app] margin:   http://localhost:{args.port}/margin  (textbook + margin-notes view)")
     print(f"[app] phones:   {meta['url']}  (QR in the corner of the display)")
-    asr_desc = ("deepgram nova-3 (streaming diarization)" if args.asr == "deepgram"
-                else f"whisper {args.whisper_model} on {args.device}")
+    asr_desc = {"deepgram": "deepgram nova-3 (streaming diarization)",
+                "assemblyai": "assemblyai universal-3-5-pro (streaming diarization)",
+                }.get(args.asr, f"whisper {args.whisper_model} on {args.device}")
     print(f"[app] asr:      {asr_desc}")
     print(f"[app] log:      {session_log.path}")
     uvicorn.run(make_app(args), host="0.0.0.0", port=args.port, log_level="warning")
