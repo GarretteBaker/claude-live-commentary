@@ -64,7 +64,7 @@ Each transcript line is prefixed with the wall-clock time it was transcribed, e.
 
 The room can vote on your comments; previous comments may carry tallies like [2↑ 1↓] and private voter notes explaining the vote. The notes are visible only to you — never quote, mention, or respond to them on screen. Use them to calibrate what this audience values, and raise the PASS bar after downvotes.
 
-You see only the RECENT window of the transcript. When a comment or a direct question genuinely needs material from earlier in the session (outside your window), reply exactly "SEARCH | <what to find>" instead of a comment — a background search agent will scan the full session and its report will appear in your next turn under "Reports from your search agent". The room sees nothing while it runs, so deliver the actual comment on a later turn using the report. Search sparingly: only for genuinely out-of-window material, never for what you can already see.
+You always see the full session transcript. If the room explicitly asks you to search or look something up ("Marginalia, search for…", "chat, look up…"), reply exactly "SEARCH | <what to find>" instead of a comment: a background web-search agent will look it up and its report will appear in your next turn under "Reports from your web-search agent". The room sees nothing while it runs, so deliver the answer as a comment on a later turn using the report. Only search when explicitly asked to.
 
 Most turns should be PASS. When you decline, reply "PASS | <ten-word reason>" so the operator can tune the system; the reason is never projected. Otherwise output only the comment text (with its quote line) — no preamble or markdown. LaTeX math with $...$ or $$...$$ delimiters renders on the screen; use it for formulas."""
 
@@ -422,8 +422,15 @@ def deepgram_transcriber_thread(audio_q: queue.Queue, args):
 
 # ---------------------------------------------------------------- commentary
 
-def build_user_prompt() -> str:
-    text = transcript.text()[-12000:]  # rolling window
+TRANSCRIPT_CHUNK = 40  # lines per immutable cache block
+
+
+def build_user_content() -> list[dict]:
+    """Full transcript first, chunked into immutable blocks with a cache
+    breakpoint on the last completed chunk. Caching is an exact-byte prefix
+    match per block, so appending into one growing block would miss every
+    time; completed chunks never change, so each call reuses the cached
+    prefix and pays full price only for new speech + the volatile tail."""
 
     def fmt(c: dict) -> str:
         tally = f"[{c['up']}↑ {c['down']}↓] " if c["up"] or c["down"] else ""
@@ -437,10 +444,26 @@ def build_user_prompt() -> str:
     reports = "\n".join(
         f"- [{r['ts']}] you asked \"{r['query']}\" → {r['report']}"
         for r in search_reports[-3:])
-    reports_block = f"Reports from your search agent:\n{reports}\n\n" if reports else ""
-    return (f"Your previous comments:\n{prev}\n\n{reports_block}"
-            f"Rolling transcript (most recent speech last):\n{text}\n\n"
-            f"Reply with PASS, SEARCH | <query>, or one comment.")
+    reports_block = f"Reports from your web-search agent:\n{reports}\n\n" if reports else ""
+    segs = transcript.tail(10**9)
+    header = "Full session transcript (most recent speech last):\n"
+    blocks: list[dict] = []
+    n_full = len(segs) // TRANSCRIPT_CHUNK
+    for i in range(n_full):
+        chunk = segs[i * TRANSCRIPT_CHUNK:(i + 1) * TRANSCRIPT_CHUNK]
+        blocks.append({"type": "text",
+                       "text": (header if i == 0 else "") + "\n".join(chunk) + "\n"})
+    if blocks:
+        blocks[-1]["cache_control"] = {"type": "ephemeral"}
+    tail_lines = segs[n_full * TRANSCRIPT_CHUNK:]
+    blocks.append({"type": "text",
+                   "text": ((header if not blocks else "")
+                            + ("\n".join(tail_lines) if tail_lines else "(nothing yet)")
+                            + "\n")})
+    blocks.append({"type": "text",
+                   "text": (f"\nYour previous comments:\n{prev}\n\n{reports_block}"
+                            f"Reply with PASS, SEARCH | <query>, or one comment.")})
+    return blocks
 
 
 def build_system_prompt() -> str:
@@ -453,30 +476,37 @@ def build_system_prompt() -> str:
 
 
 SEARCH_AGENT_SYSTEM = """\
-You are the search agent for a live-lecture commentary system. You receive the \
-FULL session transcript and one query from the live commentator, which only \
-sees a recent window. Return a compact report: the relevant quotes with their \
-[HH:MM:SS] timestamps, then a one-sentence synthesis. Under 150 words. If \
-nothing matches, say so plainly."""
+You are the web-search agent for a live-lecture commentary system. You get one \
+query from the live commentator plus a little discussion context. Search the \
+web and return a compact factual report: the answer, key numbers or dates, and \
+brief source attributions (site or paper names, no raw URLs). Under 150 words, \
+plain text. If the web doesn't settle it, say what you found and what remains \
+uncertain."""
 
 
 def search_agent_thread(client, args, query: str):
     """Spawned on demand so the fast commentary loop never blocks on it."""
     t0 = time.monotonic()
-    response = client.beta.messages.create(
-        model=args.claude_model,
-        max_tokens=1000,
-        betas=["server-side-fallback-2026-07-01"],
-        fallbacks="default",
-        output_config={"effort": "low"},
-        system=SEARCH_AGENT_SYSTEM,
-        messages=[{"role": "user",
-                   "content": f"Query: {query}\n\nFull transcript:\n{transcript.text()}"}],
-    )
+    messages = [{"role": "user", "content":
+                 f"Query: {query}\n\nRecent discussion context:\n{transcript.text()[-2000:]}"}]
+    for _hop in range(5):  # server-side tool loop can pause; resume it
+        response = client.beta.messages.create(
+            model=args.claude_model,
+            max_tokens=1500,
+            betas=["server-side-fallback-2026-07-01"],
+            fallbacks="default",
+            output_config={"effort": "low"},
+            system=SEARCH_AGENT_SYSTEM,
+            tools=[{"type": "web_search_20260209", "name": "web_search"}],
+            messages=messages,
+        )
+        if response.stop_reason != "pause_turn":
+            break
+        messages = [messages[0], {"role": "assistant", "content": response.content}]
     if response.stop_reason == "refusal":
         report = "(search refused)"
     else:
-        report = next(b.text for b in response.content if b.type == "text").strip()
+        report = " ".join(b.text for b in response.content if b.type == "text").strip()
     dt = time.monotonic() - t0
     search_reports.append({"query": query, "report": report,
                            "ts": time.strftime("%H:%M:%S")})
@@ -504,7 +534,7 @@ def stream_claude(client, args, comment_id: int) -> tuple[str, float | None]:
         fallbacks="default",
         output_config={"effort": args.effort},
         system=build_system_prompt(),
-        messages=[{"role": "user", "content": build_user_prompt()}],
+        messages=[{"role": "user", "content": build_user_content()}],
         **kwargs,
     ) as stream:
         text = ""
@@ -766,23 +796,6 @@ def make_app(args) -> FastAPI:
                             note=note)
             print(f"[grade] #{c['id']} note: {note}")
         return {"ok": True}
-
-    @app.get("/search")
-    async def search(q: str = ""):
-        """Substring search over the whole session: speech and comments."""
-        ql = q.lower().strip()
-        if not ql:
-            return {"matches": []}
-        out = []
-        for seg in transcript.tail(10**6):
-            if ql in seg.lower():
-                ts, _, text = seg.partition("] ")
-                out.append({"kind": "speech", "ts": ts.lstrip("["), "text": text})
-        for c in comments:
-            if ql in c["text"].lower():
-                out.append({"kind": "marginalia", "ts": c["ts"], "text": c["text"]})
-        out.sort(key=lambda m: m["ts"])
-        return {"matches": out[-40:]}
 
     @app.get("/events")
     async def events():

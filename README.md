@@ -72,9 +72,8 @@ diarization yet, so paralinguistics are limited to nova-3's filler words.
 - **`/?ops`** — operator pane on the right: pipeline stage, trigger state
   (new words / time to next call — i.e. *why Claude isn't commenting*),
   recent PASSes with reasons and latencies, live chattiness controls
-  (strict / chatty / eager, effective on the next call), and **full-session
-  search** over speech and comments (the operator's substring search; spawned
-  search agents also log here).
+  (strict / chatty / eager, effective on the next call); spawned web
+  searches log here too.
 - **`/?grade`** — 👍/👎 buttons on every comment (also present in `?ops`);
   open it on a phone to grade during a lecture. Live vote tallies show next
   to the buttons on every device. After voting, an optional
@@ -105,16 +104,18 @@ terminal; while a Claude call is in flight the corner shows *thinking…*.
 The commentator system prompt is `COMMENTATOR_SYSTEM` at the top of `app.py`
 (with `CHATTINESS_ADDENDA` per chattiness level).
 
-## The search agent
+## The web-search agent
 
-Marginalia only ever sees the recent transcript window — that keeps the fast
-commentary calls fast. When it needs something said earlier (e.g. "chat, what
-did she say about X an hour ago?"), it replies `SEARCH | <query>` instead of
-a comment: a **search agent** is spawned in the background (a separate
-low-effort Claude call over the full session transcript) and its report is
-injected into the next commentary turn. The feed notch shows
-`🔎 search agent · <query>` while it runs; nothing is projected until
-Marginalia follows up with an actual comment.
+Marginalia always sees the **full session transcript** (affordable because
+the transcript is sent as immutable 40-line blocks with a prompt-cache
+breakpoint — each call reads the prefix from cache at ~0.1× price and pays
+full rate only for new speech). When the room explicitly asks it to look
+something up ("Marginalia, search for…", "chat, look up…"), it replies
+`SEARCH | <query>`: a **web-search agent** is spawned in the background (a
+separate Claude call with the server-side `web_search` tool) and its report
+is injected into the next commentary turn. The feed notch shows
+`🔎 search agent · <query>` while it runs; the answer lands as a normal
+comment a turn later. It only searches when explicitly asked.
 
 ## Session logs
 

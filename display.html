@@ -103,13 +103,6 @@
   #ops-chat button.picked { border-color: #c9a45a; color: #e8e6e0; }
   #ops-passes div { margin-bottom: 0.35rem; }
   #ops-passes .t { color: #4a5262; }
-  #ops-search {
-    width: 100%; background: #161a22; border: 1px solid #2c3240; color: #e8e6e0;
-    border-radius: 6px; font: inherit; padding: 0.3em 0.6em;
-  }
-  #ops-results div { margin: 0.35rem 0; }
-  #ops-results .t { color: #4a5262; }
-  #ops-results .marginalia { color: #6faf7a; }
   /* --- live transcript feed with send-to-Claude notches --- */
   #feed {
     flex: 0 0 26vw; min-width: 260px; border-left: 1px solid #1c2028;
@@ -187,9 +180,6 @@
     </div>
     <div class="h">recent passes</div>
     <div id="ops-passes"></div>
-    <div class="h">search session</div>
-    <input id="ops-search" placeholder="search speech + comments…">
-    <div id="ops-results"></div>
   </div>
 <script>
   const current = document.getElementById("current");
@@ -458,28 +448,6 @@
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ chattiness: b.dataset.level }) })));
 
-    // session search: speech + comments, debounced
-    const box = document.getElementById("ops-search");
-    const results = document.getElementById("ops-results");
-    let searchTimer = null;
-    box.addEventListener("input", () => {
-      clearTimeout(searchTimer);
-      searchTimer = setTimeout(() => {
-        const q = box.value.trim();
-        if (!q) { results.innerHTML = ""; return; }
-        fetch("/search?q=" + encodeURIComponent(q)).then(r => r.json()).then(data => {
-          results.innerHTML = "";
-          data.matches.forEach(m => {
-            const d = document.createElement("div");
-            if (m.kind === "marginalia") d.className = "marginalia";
-            d.innerHTML = `<span class="t">${m.ts}</span> `;
-            d.append(document.createTextNode(m.text.slice(0, 160)));
-            results.append(d);
-          });
-          if (!data.matches.length) results.textContent = "(no matches)";
-        });
-      }, 250);
-    });
   }
 
   // Opt-in chime: open the page as /?chime (browsers require a click first
