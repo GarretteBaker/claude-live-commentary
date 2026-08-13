@@ -131,6 +131,7 @@
   }
   #feed .notch.pass { color: #4a5262; white-space: normal; text-transform: none; }
   #feed .notch.commented { color: #e8e6e0; }
+  #feed .notch.search { color: #c9a45a; white-space: normal; text-transform: none; }
   #feed .msg.muse {
     border-left: 2px solid #6faf7a; padding-left: 0.7em; margin: 0.7rem 0;
     font-family: Georgia, "Iowan Old Style", serif; font-size: 0.95rem;
@@ -419,6 +420,17 @@
         const d = document.createElement("div");
         d.innerHTML = `<span class="t">${ev.ts} (${ev.dt}s)</span> `;
         d.append(document.createTextNode(ev.text || "(no reason given)"));
+        const passes = document.getElementById("ops-passes");
+        passes.prepend(d);
+        while (passes.childElementCount > 10) passes.lastChild.remove();
+      }
+    } else if (ev.type === "search_spawn") {
+      resolveNotch("search", "🔎 search agent · " + ev.text.slice(0, 70));
+    } else if (ev.type === "search_done") {
+      if (opsOn) {
+        const d = document.createElement("div");
+        d.innerHTML = `<span class="t">${ev.ts} (${ev.dt}s)</span> 🔎 `;
+        d.append(document.createTextNode(ev.query));
         const passes = document.getElementById("ops-passes");
         passes.prepend(d);
         while (passes.childElementCount > 10) passes.lastChild.remove();

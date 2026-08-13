@@ -64,6 +64,8 @@ Each transcript line is prefixed with the wall-clock time it was transcribed, e.
 
 The room can vote on your comments; previous comments may carry tallies like [2↑ 1↓] and private voter notes explaining the vote. The notes are visible only to you — never quote, mention, or respond to them on screen. Use them to calibrate what this audience values, and raise the PASS bar after downvotes.
 
+You see only the RECENT window of the transcript. When a comment or a direct question genuinely needs material from earlier in the session (outside your window), reply exactly "SEARCH | <what to find>" instead of a comment — a background search agent will scan the full session and its report will appear in your next turn under "Reports from your search agent". The room sees nothing while it runs, so deliver the actual comment on a later turn using the report. Search sparingly: only for genuinely out-of-window material, never for what you can already see.
+
 Most turns should be PASS. When you decline, reply "PASS | <ten-word reason>" so the operator can tune the system; the reason is never projected. Otherwise output only the comment text (with its quote line) — no preamble or markdown. LaTeX math with $...$ or $$...$$ delimiters renders on the screen; use it for formulas."""
 
 CHATTINESS_ADDENDA = {
@@ -226,6 +228,7 @@ class Broadcaster:
 transcript = Transcript()
 broadcaster = Broadcaster()
 session_log = SessionLog()
+search_reports: list[dict] = []  # results from spawned search agents
 comments: list[dict] = []  # {"id", "text", "ts", "context"}
 # handshake for pulling the partially-filled audio chunk through whisper
 # right before a Claude call, so the prompt includes the freshest words
@@ -431,9 +434,13 @@ def build_user_prompt() -> str:
         return line
 
     prev = "\n".join(fmt(c) for c in comments[-10:]) or "(none)"
-    return (f"Your previous comments:\n{prev}\n\n"
+    reports = "\n".join(
+        f"- [{r['ts']}] you asked \"{r['query']}\" → {r['report']}"
+        for r in search_reports[-3:])
+    reports_block = f"Reports from your search agent:\n{reports}\n\n" if reports else ""
+    return (f"Your previous comments:\n{prev}\n\n{reports_block}"
             f"Rolling transcript (most recent speech last):\n{text}\n\n"
-            f"Reply with PASS or one comment.")
+            f"Reply with PASS, SEARCH | <query>, or one comment.")
 
 
 def build_system_prompt() -> str:
@@ -443,6 +450,40 @@ def build_system_prompt() -> str:
                    "curriculum, notes) — use it to sharpen comments, never "
                    "comment on it directly:\n" + config["context"])
     return system
+
+
+SEARCH_AGENT_SYSTEM = """\
+You are the search agent for a live-lecture commentary system. You receive the \
+FULL session transcript and one query from the live commentator, which only \
+sees a recent window. Return a compact report: the relevant quotes with their \
+[HH:MM:SS] timestamps, then a one-sentence synthesis. Under 150 words. If \
+nothing matches, say so plainly."""
+
+
+def search_agent_thread(client, args, query: str):
+    """Spawned on demand so the fast commentary loop never blocks on it."""
+    t0 = time.monotonic()
+    response = client.beta.messages.create(
+        model=args.claude_model,
+        max_tokens=1000,
+        betas=["server-side-fallback-2026-07-01"],
+        fallbacks="default",
+        output_config={"effort": "low"},
+        system=SEARCH_AGENT_SYSTEM,
+        messages=[{"role": "user",
+                   "content": f"Query: {query}\n\nFull transcript:\n{transcript.text()}"}],
+    )
+    if response.stop_reason == "refusal":
+        report = "(search refused)"
+    else:
+        report = next(b.text for b in response.content if b.type == "text").strip()
+    dt = time.monotonic() - t0
+    search_reports.append({"query": query, "report": report,
+                           "ts": time.strftime("%H:%M:%S")})
+    print(f"[search] ({dt:.1f}s) {query!r} → {report[:100]}")
+    session_log.log("search", query=query, report=report, dt=round(dt, 1))
+    broadcaster.publish({"type": "search_done", "query": query,
+                         "ts": time.strftime("%H:%M:%S"), "dt": round(dt, 1)})
 
 
 def stream_claude(client, args, comment_id: int) -> tuple[str, float | None]:
@@ -470,8 +511,10 @@ def stream_claude(client, args, comment_id: int) -> tuple[str, float | None]:
         for delta in stream.text_stream:
             text += delta
             clean = text.lstrip()
-            if len(clean) < 4 or clean[:4].upper() == "PASS":
-                continue  # withhold until we can rule out a PASS
+            # withhold until we can rule out PASS and SEARCH — neither displays
+            if (len(clean) < 7 or clean[:4].upper() == "PASS"
+                    or clean[:6].upper() == "SEARCH"):
+                continue
             if first is None:
                 first = time.monotonic() - t0
                 broadcaster.publish({"type": "comment_start", "id": comment_id,
@@ -553,6 +596,14 @@ def commentator_thread(args):
 
         timing = (f"{ttfw:.1f}s to first words, " if ttfw is not None else "") + f"{dt:.1f}s total"
         print(f"[claude] ({timing}) {reply}")
+        if reply.strip().upper().startswith("SEARCH"):
+            query = reply.split("|", 1)[1].strip() if "|" in reply else reply.strip()[6:].strip()
+            print(f"[claude] spawning search agent: {query!r}")
+            broadcaster.publish({"type": "search_spawn", "text": query,
+                                 "ts": time.strftime("%H:%M:%S")})
+            threading.Thread(target=lambda: search_agent_thread(client, args, query),
+                             name="search-agent", daemon=True).start()
+            continue
         if reply.strip().upper().startswith("PASS"):
             reason = reply.split("|", 1)[1].strip() if "|" in reply else ""
             broadcaster.publish({"type": "pass", "text": reason,

@@ -73,7 +73,8 @@ diarization yet, so paralinguistics are limited to nova-3's filler words.
   (new words / time to next call — i.e. *why Claude isn't commenting*),
   recent PASSes with reasons and latencies, live chattiness controls
   (strict / chatty / eager, effective on the next call), and **full-session
-  search** over speech and comments.
+  search** over speech and comments (the operator's substring search; spawned
+  search agents also log here).
 - **`/?grade`** — 👍/👎 buttons on every comment (also present in `?ops`);
   open it on a phone to grade during a lecture. Live vote tallies show next
   to the buttons on every device. After voting, an optional
@@ -103,6 +104,17 @@ terminal; while a Claude call is in flight the corner shows *thinking…*.
 
 The commentator system prompt is `COMMENTATOR_SYSTEM` at the top of `app.py`
 (with `CHATTINESS_ADDENDA` per chattiness level).
+
+## The search agent
+
+Marginalia only ever sees the recent transcript window — that keeps the fast
+commentary calls fast. When it needs something said earlier (e.g. "chat, what
+did she say about X an hour ago?"), it replies `SEARCH | <query>` instead of
+a comment: a **search agent** is spawned in the background (a separate
+low-effort Claude call over the full session transcript) and its report is
+injected into the next commentary turn. The feed notch shows
+`🔎 search agent · <query>` while it runs; nothing is projected until
+Marginalia follows up with an actual comment.
 
 ## Session logs
 
