@@ -1,44 +1,46 @@
 # Priority-ordered: the first 100 non-comment lines are sent to AssemblyAI
-# (API cap). People in the room first, then vocabulary ASR will butcher and
-# Claude can't repair. Famous names/orgs sit below the cut — both ASR and
-# Claude usually recover those from context.
+# (API cap; the startup log prints the number used).
+# TECHNICAL TERMINOLOGY AND ACRONYMS FIRST — names only in leftover slots.
 
 # --- the system itself ---
 claude
 Marginalia
 
-# --- SLT / event-core vocabulary ---
+# --- technical terminology & acronyms ---
 RLCT
+SGLD
+GHMM
+SAEs
+RLHF
+HCH
+FDT
+UDT
+CDT
+EDT
+AIXI
 singular learning theory
 local learning coefficient
-SGLD
 devinterp
-Watanabe
-Timaeus
-Iliad
 epsilon-machine
 computational mechanics
 mixed state presentation
 belief state geometry
-GHMM
 natural latents
 grokking
-
-# --- agenda jargon ASR will butcher ---
 infra-Bayesianism
 Löb's theorem
+Löbian
 logical induction
 tiling agents
-AIXI
 Solomonoff induction
 Kolmogorov complexity
 mesa-optimization
 corrigibility
 Eliciting Latent Knowledge
 heuristic arguments
+obfuscated arguments
 factored cognition
 Prover-Estimator Debate
-Marcus Hutter
 sparse autoencoders
 induction heads
 residual stream
@@ -53,8 +55,21 @@ goal misgeneralisation
 instrumental convergence
 scalable oversight
 iterated distillation and amplification
+Coherent Extrapolated Volition
+FairBot
+steganography
+Sleeper Agents
+subliminal learning
+inoculation prompting
+neural tangent kernel
+sycophancy
+monitorability
+parametrically retargetable
+free energy
+Hessian
+degeneracy
 
-# --- people in the room (slides roster + mega-doc) ---
+# --- names, in leftover slots ---
 Garrett Baker
 Alexander Gietelink Oldenziel
 Dan Murfet
@@ -96,6 +111,8 @@ Dawn Chen
 Emanuel Ruzak
 Greg Rosenthal
 Guillermo Sanmarco
+
+# ============ below the 100 cap from here (roster tail + famous) ============
 Hak Hyun Kim
 Hatem Elshatlawy
 Jose Faustino
@@ -120,30 +137,10 @@ Simon Elias Schrader
 Trinidad Borrell
 Vincent Tran
 Will Lancer
-
-# ============ explicitly deprioritized ============
-# (the 100-cap is counted from the top and may already have been
-#  reached above this line — the startup log prints the number used)
-# (kept for reference / future swaps; famous enough that ASR+Claude
-# usually recover them)
-Coherent Extrapolated Volition
-FairBot
-steganography
-Sleeper Agents
-subliminal learning
-inoculation prompting
-neural tangent kernel
-HCH
-FDT
-UDT
-CDT
-EDT
-RLHF
-SAEs
-sycophancy
-monitorability
-parametrically retargetable
-Löbian
+Watanabe
+Marcus Hutter
+Timaeus
+Iliad
 Eliezer Yudkowsky
 Paul Christiano
 John Wentworth
