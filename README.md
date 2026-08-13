@@ -46,14 +46,16 @@ uv run app.py --mock                  # no API key, canned comments
 
 ## Views
 
-- **http://localhost:8710** — projection page: comments on the left, the live
-  labeled transcript on the right (`?nofeed` hides it) with a **notch at each
-  point the transcript was sent to Claude**, resolving to `commented` or
-  `pass · reason` — so the room can see what it is thinking about. A QR code
-  in the corner (hide with `/?noqr`) points phones at the LAN address, also
-  printed at startup.
-- **On phones** the same page becomes a scrollable feed (long history, ticker
-  pinned to the bottom); add `?grade` for grading buttons.
+- **http://localhost:8710** — projection page: the current comment large on
+  the left, and the **full chat history** on the right (`?nofeed` hides it):
+  the labeled transcript with Muse's comments backfilled in place, plus a
+  notch at each point the transcript was sent to Claude, resolving to
+  `commented` or `pass · reason` — the room can see exactly what it is
+  thinking about. Late joiners get the recent conversation replayed in
+  order. A QR code in the corner (hide with `/?noqr`) points phones at the
+  LAN address, also printed at startup.
+- **On phones** the same page becomes a scrollable chat feed (current comment
+  on top, full conversation below); add `?grade` for grading buttons.
 - **`/?chime`** — adds a soft two-note chime on each comment (click the page
   once to unlock audio).
 - **`/?ops`** — operator pane on the right: pipeline stage, trigger state

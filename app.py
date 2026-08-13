@@ -624,14 +624,18 @@ def make_app(args) -> FastAPI:
     async def events():
         async def gen():
             q = broadcaster.subscribe()
-            # replay context for late joiners; stored lines are "[HH:MM:SS] text"
-            for seg in transcript.tail(15):
+            # replay the recent conversation for late joiners, interleaved in
+            # time order; stored transcript lines are "[HH:MM:SS] text"
+            replay = []
+            for seg in transcript.tail(25):
                 ts, _, text = seg.partition("] ")
-                yield ("data: " + json.dumps({"type": "transcript",
-                                              "text": text, "ts": ts.lstrip("[")}) + "\n\n")
-            for c in comments[-5:]:
-                yield ("data: " + json.dumps({"type": "comment", "id": c["id"],
-                                              "text": c["text"], "ts": ""}) + "\n\n")
+                ts = ts.lstrip("[")
+                replay.append((ts, {"type": "transcript", "text": text, "ts": ts}))
+            for c in comments[-8:]:
+                replay.append((c["ts"], {"type": "comment", "id": c["id"],
+                                         "text": c["text"], "ts": c["ts"]}))
+            for _ts, ev in sorted(replay, key=lambda p: p[0]):
+                yield f"data: {json.dumps(ev)}\n\n"
             while True:
                 event = await q.get()
                 yield f"data: {json.dumps(event)}\n\n"
