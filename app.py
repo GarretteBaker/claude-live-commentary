@@ -362,6 +362,61 @@ def transcriber_thread(audio_q: queue.Queue, args):
             buf.clear()
 
 
+def deepgram_transcriber_thread(audio_q: queue.Queue, args):
+    """Streaming ASR via Deepgram nova-3: word-level diarization, smart
+    formatting, filler words. Used when --asr deepgram (or auto + key set)."""
+    import websocket
+
+    params = ("model=nova-3&encoding=linear16&sample_rate=16000&channels=1"
+              "&diarize=true&smart_format=true&interim_results=false&filler_words=true")
+    ws = websocket.create_connection(
+        f"wss://api.deepgram.com/v1/listen?{params}",
+        header=[f"Authorization: Token {os.environ['DEEPGRAM_API_KEY']}"],
+    )
+    print("[deepgram] connected: nova-3, streaming diarization on")
+    broadcaster.publish({"type": "status", "text": "listening"})
+
+    durations: dict[int, float] = {}  # speaker index -> accumulated airtime
+
+    def label(spk) -> str:
+        if spk is None:
+            return "SPEAKER"
+        lecturer = max(durations, key=durations.get)
+        return ("LECTURER" if spk == lecturer
+                else f"AUDIENCE-{spk if spk < lecturer else spk - 1}")
+
+    def sender():
+        while True:
+            ws.send_binary(audio_q.get())
+
+    threading.Thread(target=sender, name="deepgram-sender", daemon=True).start()
+
+    while True:
+        msg = json.loads(ws.recv())
+        if msg.get("type") != "Results":
+            continue
+        words = msg["channel"]["alternatives"][0]["words"]
+        if not words:
+            continue
+        # group consecutive words by speaker into lines
+        lines: list[tuple[int | None, list[str]]] = []
+        for w in words:
+            spk = w.get("speaker")
+            durations[spk] = durations.get(spk, 0.0) + (w["end"] - w["start"])
+            token = w.get("punctuated_word", w["word"])
+            if lines and lines[-1][0] == spk:
+                lines[-1][1].append(token)
+            else:
+                lines.append((spk, [token]))
+        for spk, tokens in lines:
+            line = f"{label(spk)}: {' '.join(tokens)}"
+            transcript.append(f"[{time.strftime('%H:%M:%S')}] {line}")
+            print(f"[asr] {line}")
+            broadcaster.publish({"type": "transcript", "text": line,
+                                 "ts": time.strftime("%H:%M:%S")})
+            session_log.log("transcript", text=line)
+
+
 # ---------------------------------------------------------------- commentary
 
 def build_user_prompt() -> str:
@@ -475,10 +530,12 @@ def commentator_thread(args):
             continue
 
         # pull the partially-filled audio chunk through whisper first, so
-        # Claude sees the freshest words rather than a chunk-boundary-stale view
-        flush_done.clear()
-        flush_req.set()
-        flush_done.wait(timeout=3.0)
+        # Claude sees the freshest words rather than a chunk-boundary-stale
+        # view (deepgram streams continuously; nothing to flush)
+        if args.asr == "whisper":
+            flush_done.clear()
+            flush_req.set()
+            flush_done.wait(timeout=3.0)
 
         last_fire = time.monotonic()
         seen_words = transcript.word_count()
@@ -537,9 +594,11 @@ def make_app(args) -> FastAPI:
                 audio_q.put(b)
             print("[audio] stream ended")
 
+        transcriber = (deepgram_transcriber_thread if args.asr == "deepgram"
+                       else transcriber_thread)
         targets = {
             "audio": reader,
-            "transcriber": lambda: transcriber_thread(audio_q, args),
+            "transcriber": lambda: transcriber(audio_q, args),
             "commentator": lambda: commentator_thread(args),
         }
 
@@ -565,6 +624,19 @@ def make_app(args) -> FastAPI:
                       "rerun without --fast", flush=True)
                 broadcaster.publish({"type": "status",
                                      "text": "commentator crashed — see terminal"})
+            elif exc.thread.name == "transcriber" and args.asr == "deepgram" and (
+                    issubclass(exc.exc_type, (OSError, ConnectionError))
+                    or "WebSocket" in exc.exc_type.__name__):
+                print("[deepgram] connection lost — reconnecting in 5s", flush=True)
+                broadcaster.publish({"type": "status", "text": "reconnecting ASR…"})
+
+                def relaunch_asr():
+                    time.sleep(5)
+                    broadcaster.publish({"type": "status", "text": "live"})
+                    spawn("transcriber")
+
+                threading.Thread(target=relaunch_asr, name="asr-relauncher",
+                                 daemon=True).start()
             elif exc.thread.name == "commentator" and issubclass(exc.exc_type, transient):
                 print("[commentator] transient failure — restarting in 15s", flush=True)
                 broadcaster.publish({"type": "status", "text": "reconnecting to Claude…"})
@@ -625,6 +697,8 @@ def make_app(args) -> FastAPI:
         c = comments[int(body["id"])]
         if body["grade"] in ("up", "down"):
             c[body["grade"]] += 1
+            broadcaster.publish({"type": "grade", "id": c["id"],
+                                 "up": c["up"], "down": c["down"]})
         session_log.log("grade", id=c["id"], comment=c["text"],
                         grade=body["grade"], note=body.get("note", ""))
         print(f"[grade] #{c['id']} {body['grade']} (now {c['up']}↑ {c['down']}↓)")
@@ -642,6 +716,23 @@ def make_app(args) -> FastAPI:
             print(f"[grade] #{c['id']} note: {note}")
         return {"ok": True}
 
+    @app.get("/search")
+    async def search(q: str = ""):
+        """Substring search over the whole session: speech and comments."""
+        ql = q.lower().strip()
+        if not ql:
+            return {"matches": []}
+        out = []
+        for seg in transcript.tail(10**6):
+            if ql in seg.lower():
+                ts, _, text = seg.partition("] ")
+                out.append({"kind": "speech", "ts": ts.lstrip("["), "text": text})
+        for c in comments:
+            if ql in c["text"].lower():
+                out.append({"kind": "marginalia", "ts": c["ts"], "text": c["text"]})
+        out.sort(key=lambda m: m["ts"])
+        return {"matches": out[-40:]}
+
     @app.get("/events")
     async def events():
         async def gen():
@@ -655,7 +746,8 @@ def make_app(args) -> FastAPI:
                 replay.append((ts, {"type": "transcript", "text": text, "ts": ts}))
             for c in comments[-8:]:
                 replay.append((c["ts"], {"type": "comment", "id": c["id"],
-                                         "text": c["text"], "ts": c["ts"]}))
+                                         "text": c["text"], "ts": c["ts"],
+                                         "up": c["up"], "down": c["down"]}))
             for _ts, ev in sorted(replay, key=lambda p: p[0]):
                 yield f"data: {json.dumps(ev)}\n\n"
             while True:
@@ -675,6 +767,9 @@ def main():
                    help="audio/video file or YouTube/etc. URL to simulate a live feed from (mic if omitted)")
     p.add_argument("--speed", type=float, default=1.0, help="playback speed for --wav")
     p.add_argument("--mock", action="store_true", help="canned comments instead of the Claude API")
+    p.add_argument("--asr", default="auto", choices=["auto", "whisper", "deepgram"],
+                   help="auto = deepgram streaming (nova-3, word-level diarization) when "
+                        "DEEPGRAM_API_KEY is set, else local whisper")
     p.add_argument("--whisper-model", default="distil-large-v3",
                    help="faster-whisper model; small.en is a lighter fallback")
     p.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
@@ -702,6 +797,10 @@ def main():
     p.add_argument("--port", type=int, default=8710)
     args = p.parse_args()
 
+    if args.asr == "auto":
+        args.asr = "deepgram" if os.environ.get("DEEPGRAM_API_KEY") else "whisper"
+    if args.asr == "deepgram" and not os.environ.get("DEEPGRAM_API_KEY"):
+        sys.exit("--asr deepgram needs DEEPGRAM_API_KEY in the environment")
     ensure_cuda_libs()
     args.device = resolve_device(args.device)
     config["chattiness"] = "chatty" if args.chatty and args.chattiness == "strict" else args.chattiness
@@ -714,7 +813,9 @@ def main():
     print(f"[app] project:  {Path(__file__).resolve().parent}")
     print(f"[app] display:  http://localhost:{args.port}  (project this)")
     print(f"[app] phones:   {meta['url']}  (QR in the corner of the display)")
-    print(f"[app] whisper:  {args.whisper_model} on {args.device}")
+    asr_desc = ("deepgram nova-3 (streaming diarization)" if args.asr == "deepgram"
+                else f"whisper {args.whisper_model} on {args.device}")
+    print(f"[app] asr:      {asr_desc}")
     print(f"[app] log:      {session_log.path}")
     uvicorn.run(make_app(args), host="0.0.0.0", port=args.port, log_level="warning")
 

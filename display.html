@@ -80,6 +80,7 @@
     padding: 0.25em 0.6em; margin-left: 0.5em; width: 200px; max-width: 45vw;
   }
   .gradenote::placeholder { color: #4a5262; }
+  .tally { font-size: 0.7rem; color: #6faf7a; margin-left: 0.25em; }
   .noted { color: #6faf7a; font: 0.75rem system-ui, sans-serif;
            font-style: normal; margin-left: 0.5em; }
   /* --- operator pane (?ops) --- */
@@ -102,6 +103,13 @@
   #ops-chat button.picked { border-color: #c9a45a; color: #e8e6e0; }
   #ops-passes div { margin-bottom: 0.35rem; }
   #ops-passes .t { color: #4a5262; }
+  #ops-search {
+    width: 100%; background: #161a22; border: 1px solid #2c3240; color: #e8e6e0;
+    border-radius: 6px; font: inherit; padding: 0.3em 0.6em;
+  }
+  #ops-results div { margin: 0.35rem 0; }
+  #ops-results .t { color: #4a5262; }
+  #ops-results .marginalia { color: #6faf7a; }
   /* --- live transcript feed with send-to-Claude notches --- */
   #feed {
     flex: 0 0 26vw; min-width: 260px; border-left: 1px solid #1c2028;
@@ -178,6 +186,9 @@
     </div>
     <div class="h">recent passes</div>
     <div id="ops-passes"></div>
+    <div class="h">search session</div>
+    <input id="ops-search" placeholder="search speech + comments…">
+    <div id="ops-results"></div>
   </div>
 <script>
   const current = document.getElementById("current");
@@ -227,12 +238,16 @@
     return { quote, body };
   }
 
-  function gradeButtons(id) {
+  function gradeButtons(id, counts) {
     const span = document.createElement("span");
     span.className = "gradebtns";
     [["👍", "up"], ["👎", "down"]].forEach(([face, grade]) => {
       const b = document.createElement("button");
       b.textContent = face;
+      const n = document.createElement("span");
+      n.className = "tally"; n.dataset.id = id; n.dataset.g = grade;
+      n.textContent = counts && counts[grade] ? counts[grade] : "";
+      b.append(n);
       b.addEventListener("click", (e) => {
         e.stopPropagation();
         fetch("/grade", { method: "POST",
@@ -271,7 +286,8 @@
       el.append(q);
     }
     el.append(document.createTextNode(body));
-    if (gradeOn && comment.id != null) el.append(gradeButtons(comment.id));
+    if (gradeOn && comment.id != null)
+      el.append(gradeButtons(comment.id, { up: comment.up, down: comment.down }));
     if (withTs && comment.ts) {
       const ts = document.createElement("span");
       ts.className = "ts"; ts.textContent = comment.ts;
@@ -293,17 +309,24 @@
     if (stick) feed.scrollTop = feed.scrollHeight;
   }
 
+  let feedLastWho = null;   // merge consecutive same-speaker lines visually
+
   function feedMessage(ev) {
     const d = document.createElement("div");
     d.className = "msg";
-    const m = ev.text.match(/^(LECTURER|AUDIENCE-\d+): (.*)$/s);
+    const m = ev.text.match(/^(LECTURER|AUDIENCE-\d+|SPEAKER): (.*)$/s);
     if (m) {
-      const who = document.createElement("span");
-      who.className = "who" + (m[1].startsWith("AUDIENCE") ? " audience" : "");
-      who.textContent = m[1] + " ";
-      d.append(who, document.createTextNode(m[2]));
+      if (m[1] !== feedLastWho) {
+        const who = document.createElement("span");
+        who.className = "who" + (m[1].startsWith("AUDIENCE") ? " audience" : "");
+        who.textContent = m[1] + " ";
+        d.append(who);
+      }
+      d.append(document.createTextNode(m[2]));
+      feedLastWho = m[1];
     } else {
       d.append(document.createTextNode(ev.text));
+      feedLastWho = null;
     }
     if (ev.ts) {
       const t = document.createElement("span");
@@ -325,6 +348,7 @@
     const body = document.createElement("div");
     renderInto(body, c, false);
     d.append(who, body);
+    feedLastWho = null;
     feedAppend(d);
   }
 
@@ -333,6 +357,7 @@
     d.className = "notch";
     d.textContent = `sent to claude ${ts} · thinking…`;
     pendingNotch = { el: d, ts };
+    feedLastWho = null;   // a notch breaks the speaker run
     feedAppend(d);
   }
 
@@ -398,6 +423,11 @@
         passes.prepend(d);
         while (passes.childElementCount > 10) passes.lastChild.remove();
       }
+    } else if (ev.type === "grade") {
+      document.querySelectorAll(`.tally[data-id="${ev.id}"]`).forEach(t => {
+        const n = ev[t.dataset.g];
+        t.textContent = n ? n : "";
+      });
     } else if (ev.type === "config") {
       markChattiness(ev.chattiness);
     }
@@ -415,6 +445,29 @@
         fetch("/config", { method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ chattiness: b.dataset.level }) })));
+
+    // session search: speech + comments, debounced
+    const box = document.getElementById("ops-search");
+    const results = document.getElementById("ops-results");
+    let searchTimer = null;
+    box.addEventListener("input", () => {
+      clearTimeout(searchTimer);
+      searchTimer = setTimeout(() => {
+        const q = box.value.trim();
+        if (!q) { results.innerHTML = ""; return; }
+        fetch("/search?q=" + encodeURIComponent(q)).then(r => r.json()).then(data => {
+          results.innerHTML = "";
+          data.matches.forEach(m => {
+            const d = document.createElement("div");
+            if (m.kind === "marginalia") d.className = "marginalia";
+            d.innerHTML = `<span class="t">${m.ts}</span> `;
+            d.append(document.createTextNode(m.text.slice(0, 160)));
+            results.append(d);
+          });
+          if (!data.matches.length) results.textContent = "(no matches)";
+        });
+      }, 250);
+    });
   }
 
   // Opt-in chime: open the page as /?chime (browsers require a click first

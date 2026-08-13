@@ -4,10 +4,9 @@ MVP of Alexander's proposal (ILIAD intensive): a room conversation is recorded,
 transcribed live, and an LLM occasionally projects a short text comment onto a
 screen.
 
-Pipeline: mic (`parecord`) or recording (`ffmpeg`) → 16 kHz PCM →
-faster-whisper (~7 s chunks, local GPU: distil-large-v3 by default) → speaker
-labeling (ECAPA embeddings, greedy online clustering; the cluster with the most
-airtime is `LECTURER`, others are `AUDIENCE-n` — no enrollment needed) → at
+Pipeline: mic (`parecord`) or recording (`ffmpeg`) → 16 kHz PCM → ASR →
+speaker labeling (the speaker with the most airtime is `LECTURER`, others are
+`AUDIENCE-n` — no enrollment needed) → at
 each opportunity Claude sees the labeled rolling transcript + its previous
 comments and replies `PASS | reason` or one ≤25-word comment → FastAPI page
 (SSE) styled for projection.
@@ -44,6 +43,17 @@ uv run app.py --wav talk.mp3 --speed 4 --call-gap 5   # fast replay
 uv run app.py --mock                  # no API key, canned comments
 ```
 
+## ASR backends
+
+`--asr auto` (default) picks **Deepgram nova-3 streaming** when
+`DEEPGRAM_API_KEY` is set — true streaming with word-level diarization, smart
+formatting, and filler words — and otherwise falls back to **local
+faster-whisper** (~7 s chunks on the GPU, ECAPA-embedding speaker clustering,
+private, no cloud). Force either with `--asr whisper` / `--asr deepgram`.
+Deepgram reconnects automatically on network blips. Neither backend tags
+laughter/applause; ElevenLabs Scribe has audio events but no streaming
+diarization yet, so paralinguistics are limited to nova-3's filler words.
+
 ## Views
 
 - **http://localhost:8710** — projection page: the current comment large on
@@ -61,10 +71,12 @@ uv run app.py --mock                  # no API key, canned comments
   once to unlock audio).
 - **`/?ops`** — operator pane on the right: pipeline stage, trigger state
   (new words / time to next call — i.e. *why Claude isn't commenting*),
-  recent PASSes with reasons and latencies, and live chattiness controls
-  (strict / chatty / eager, effective on the next call).
+  recent PASSes with reasons and latencies, live chattiness controls
+  (strict / chatty / eager, effective on the next call), and **full-session
+  search** over speech and comments.
 - **`/?grade`** — 👍/👎 buttons on every comment (also present in `?ops`);
-  open it on a phone to grade during a lecture. After voting, an optional
+  open it on a phone to grade during a lecture. Live vote tallies show next
+  to the buttons on every device. After voting, an optional
   "why?" note can be typed — it is **private to Marginalia** (fed into its
   prompt alongside the vote tallies, never shown on any screen) and lands
   in the session log.
@@ -78,6 +90,7 @@ terminal; while a Claude call is in flight the corner shows *thinking…*.
 |---|---|---|
 | `--chattiness` | `strict` | `strict` / `chatty` / `eager`; retunable live from `/?ops` (`--chatty` = `chatty`) |
 | `--context` | — | text file (abstract, curriculum, notes) given to the commentator as background |
+| `--asr` | `auto` | `deepgram` (streaming diarization; needs `DEEPGRAM_API_KEY`) or local `whisper` |
 | `--whisper-model` | `distil-large-v3` | `small.en` is lighter; both fly on the GPU (~0.2–0.5 s / 7 s chunk, ≤2 GB VRAM) |
 | `--device` | `auto` | cuda when available (nvidia pip wheels; app re-execs once to set `LD_LIBRARY_PATH`) |
 | `--chunk-sec` | 7 | transcription chunk length (latency vs. context) |
