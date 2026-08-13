@@ -175,6 +175,15 @@
     return span;
   }
 
+  function pushCurrentToHistory() {
+    if (!lastComment || !lastComment.text) return;
+    const d = document.createElement("div");
+    d.className = "item";
+    renderInto(d, lastComment, false);
+    history.prepend(d);
+    while (history.childElementCount > 6) history.lastChild.remove();
+  }
+
   function renderInto(el, comment, withTs) {
     el.innerHTML = "";
     const { quote, body } = splitComment(comment.text);
@@ -201,30 +210,30 @@
     if (ev.type === "transcript") {
       tickerText = (tickerText + " " + ev.text).slice(-300);
       ticker.textContent = tickerText;
-    } else if (ev.type === "comment") {
-      if (lastComment) {
-        const d = document.createElement("div");
-        d.className = "item";
-        renderInto(d, lastComment, false);
-        history.prepend(d);
-        while (history.childElementCount > 6) history.lastChild.remove();
-      }
-      const show = () => {
-        renderInto(current, ev, true);
-        current.classList.add("shown");
-        current.classList.remove("pulse");
-        void current.offsetWidth;  // restart the animation
-        current.classList.add("pulse");
-        if (ev.ts) chime();  // replayed history has no timestamp -> silent
-      };
-      const hadPrevious = lastComment !== null;
+    } else if (ev.type === "comment") {          // full comment (replay for late joiners)
+      pushCurrentToHistory();
       lastComment = { id: ev.id, text: ev.text };
-      if (hadPrevious) {
-        current.classList.remove("shown");
-        setTimeout(show, 250);
-      } else {
-        show();
+      renderInto(current, ev, true);
+      current.classList.add("shown");
+    } else if (ev.type === "comment_start" || ev.type === "comment_delta") {
+      if (!lastComment || lastComment.id !== ev.id) {   // new comment beginning
+        pushCurrentToHistory();
+        lastComment = { id: ev.id, text: "", ts: ev.ts || "" };
+        current.classList.remove("pulse");
+        current.classList.add("shown");
       }
+      if (ev.type === "comment_delta") {
+        lastComment.text = ev.text;
+        renderInto(current, { id: null, text: ev.text }, false);
+      }
+    } else if (ev.type === "comment_done") {
+      lastComment = { id: ev.id, text: ev.text };
+      renderInto(current, ev, true);
+      current.classList.add("shown");
+      current.classList.remove("pulse");
+      void current.offsetWidth;  // restart the animation
+      current.classList.add("pulse");
+      if (ev.ts) chime();
     } else if (ev.type === "status") {
       setStatus(ev.text);
     } else if (ev.type === "stage") {
@@ -233,7 +242,7 @@
       const wordsOk = ev.new_words >= ev.need_words ? "✓" : "✗";
       document.getElementById("ops-tick").textContent =
         `${ev.new_words}/${ev.need_words} new words ${wordsOk} · ` +
-        `lull ${ev.lull}s/${ev.need_lull}s · interval fires ≤${ev.next_due}s`;
+        (ev.wait > 0 ? `next call in ≥${ev.wait}s` : "call ready");
     } else if (ev.type === "pass" && opsOn) {
       const d = document.createElement("div");
       d.innerHTML = `<span class="t">${ev.ts} (${ev.dt}s)</span> `;

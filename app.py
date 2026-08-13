@@ -153,12 +153,10 @@ class Transcript:
     def __init__(self):
         self._lock = threading.Lock()
         self._segments: list[str] = []
-        self.last_append = time.monotonic()
 
     def append(self, text: str):
         with self._lock:
             self._segments.append(text)
-            self.last_append = time.monotonic()
 
     def text(self) -> str:
         with self._lock:
@@ -166,6 +164,31 @@ class Transcript:
 
     def word_count(self) -> int:
         return len(self.text().split())
+
+
+class SessionLog:
+    """One JSONL file per run under sessions/: every transcript line, every
+    Claude reply (comments and PASSes, with timing), config changes, grades.
+    Lazy start() so the pre-re-exec process (ensure_cuda_libs) creates nothing."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.path: Path | None = None
+
+    def start(self, args):
+        d = Path(__file__).parent / "sessions"
+        d.mkdir(exist_ok=True)
+        self.path = d / (time.strftime("%Y%m%d-%H%M%S") + ".jsonl")
+        self.log("session_start", source=args.wav or "mic", speed=args.speed,
+                 model=args.claude_model, effort=args.effort,
+                 chattiness=config["chattiness"], whisper=args.whisper_model)
+
+    def log(self, type_: str, **fields):
+        if self.path is None:
+            return
+        entry = {"t": time.strftime("%Y-%m-%dT%H:%M:%S"), "type": type_, **fields}
+        with self._lock, open(self.path, "a") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
 class Broadcaster:
@@ -194,6 +217,7 @@ class Broadcaster:
 
 transcript = Transcript()
 broadcaster = Broadcaster()
+session_log = SessionLog()
 comments: list[dict] = []  # {"id", "text", "ts", "context"}
 # handshake for pulling the partially-filled audio chunk through whisper
 # right before a Claude call, so the prompt includes the freshest words
@@ -304,6 +328,7 @@ def transcriber_thread(audio_q: queue.Queue, args):
             transcript.append(line)
             print(f"[asr] ({dt:.2f}s) {line}")
             broadcaster.publish({"type": "transcript", "text": line})
+            session_log.log("transcript", text=line)
 
     while True:
         buf.extend(audio_q.get())
@@ -337,8 +362,14 @@ def build_system_prompt() -> str:
     return system
 
 
-def ask_claude(client, args) -> str:
-    response = client.beta.messages.create(
+def stream_claude(client, args, comment_id: int) -> tuple[str, float | None]:
+    """Stream a reply, publishing deltas to the display as soon as it is
+    clear the reply is a comment rather than a PASS.
+    Returns (full text, seconds to first displayed words or None)."""
+    t0 = time.monotonic()
+    first = None
+    shown = ""
+    with client.beta.messages.stream(
         model=args.claude_model,
         max_tokens=500,
         betas=["server-side-fallback-2026-07-01"],
@@ -346,10 +377,39 @@ def ask_claude(client, args) -> str:
         output_config={"effort": args.effort},
         system=build_system_prompt(),
         messages=[{"role": "user", "content": build_user_prompt()}],
-    )
-    if response.stop_reason == "refusal":
-        return "PASS"
-    return next(b.text for b in response.content if b.type == "text").strip()
+    ) as stream:
+        text = ""
+        for delta in stream.text_stream:
+            text += delta
+            clean = text.lstrip()
+            if len(clean) < 4 or clean[:4].upper() == "PASS":
+                continue  # withhold until we can rule out a PASS
+            if first is None:
+                first = time.monotonic() - t0
+                broadcaster.publish({"type": "comment_start", "id": comment_id,
+                                     "ts": time.strftime("%H:%M:%S")})
+            if clean != shown:
+                shown = clean
+                broadcaster.publish({"type": "comment_delta", "id": comment_id,
+                                     "text": clean})
+        final = stream.get_final_message()
+    if final.stop_reason == "refusal":
+        return "PASS", first
+    return text.strip(), first
+
+
+def stream_mock(comment_id: int) -> tuple[str, float | None]:
+    reply = next(MOCK_COMMENTS, "PASS | out of canned comments")
+    if reply.upper().startswith("PASS"):
+        return reply, None
+    broadcaster.publish({"type": "comment_start", "id": comment_id,
+                         "ts": time.strftime("%H:%M:%S")})
+    shown = ""
+    for word in reply.split(" "):
+        shown = (shown + " " + word).strip()
+        time.sleep(0.08)
+        broadcaster.publish({"type": "comment_delta", "id": comment_id, "text": shown})
+    return reply, 0.08
 
 
 MOCK_COMMENTS = iter([
@@ -368,24 +428,17 @@ def commentator_thread(args):
         client = anthropic.Anthropic(max_retries=4)  # ride out short network blips
 
     seen_words = 0
-    last_fire = time.monotonic()
+    last_fire = time.monotonic() - args.call_gap  # allow an early first call
     while True:
         time.sleep(1.0)
         now = time.monotonic()
-        # Fire on a lull in speech (comment lands when eyes can go to the
-        # screen) or when the interval has elapsed, but only given new speech.
-        lull = now - transcript.last_append >= args.lull_sec
-        due = now - last_fire >= args.comment_interval
         n = transcript.word_count()
-        broadcaster.publish({
-            "type": "tick",
-            "new_words": n - seen_words, "need_words": args.min_new_words,
-            "lull": round(now - transcript.last_append, 1), "need_lull": args.lull_sec,
-            "next_due": max(0, round(args.comment_interval - (now - last_fire))),
-        })
-        if not (lull or due):
-            continue
-        if n - seen_words < args.min_new_words:
+        # Speculative firing: call as soon as enough new speech accumulated,
+        # even mid-sentence — the reply streams to the screen as it is written.
+        wait = max(0, round(args.call_gap - (now - last_fire)))
+        broadcaster.publish({"type": "tick", "new_words": n - seen_words,
+                             "need_words": args.min_new_words, "wait": wait})
+        if wait > 0 or n - seen_words < args.min_new_words:
             continue
 
         # pull the partially-filled audio chunk through whisper first, so
@@ -396,30 +449,35 @@ def commentator_thread(args):
 
         last_fire = time.monotonic()
         seen_words = transcript.word_count()
+        comment_id = len(comments)
 
         broadcaster.publish({"type": "stage", "text": "thinking…"})
         t0 = time.monotonic()
         if args.mock:
-            reply = next(MOCK_COMMENTS, "PASS")
+            reply, ttfw = stream_mock(comment_id)
         else:
-            reply = ask_claude(client, args)
+            reply, ttfw = stream_claude(client, args, comment_id)
         dt = time.monotonic() - t0
         broadcaster.publish({"type": "stage", "text": "listening"})
 
-        trigger = "lull" if lull else "interval"
-        print(f"[claude] ({dt:.1f}s, {trigger}) {reply}")
+        timing = (f"{ttfw:.1f}s to first words, " if ttfw is not None else "") + f"{dt:.1f}s total"
+        print(f"[claude] ({timing}) {reply}")
         if reply.strip().upper().startswith("PASS"):
             reason = reply.split("|", 1)[1].strip() if "|" in reply else ""
             broadcaster.publish({"type": "pass", "text": reason,
                                  "ts": time.strftime("%H:%M:%S"), "dt": round(dt, 1)})
+            session_log.log("pass", reason=reason, dt=round(dt, 1))
             continue
-        comment = {"id": len(comments), "text": reply,
+        comment = {"id": comment_id, "text": reply,
                    "ts": time.strftime("%H:%M:%S"),
                    "context": transcript.text()[-1500:]}
         comments.append(comment)
-        broadcaster.publish({"type": "comment", "id": comment["id"],
+        broadcaster.publish({"type": "comment_done", "id": comment["id"],
                              "text": comment["text"], "ts": comment["ts"],
                              "dt": round(dt, 1)})
+        session_log.log("comment", id=comment["id"], text=comment["text"],
+                        ttfw=round(ttfw, 1) if ttfw is not None else None,
+                        dt=round(dt, 1))
 
 
 # ---------------------------------------------------------------- web
@@ -454,9 +512,11 @@ def make_app(args) -> FastAPI:
             threading.Thread(target=targets[name], name=name, daemon=True).start()
 
         def on_thread_crash(exc):
-            print(f"\n[FATAL] {exc.thread.name} thread crashed:", flush=True)
             import traceback
-            traceback.print_exception(exc.exc_type, exc.exc_value, exc.exc_traceback)
+            tb = "".join(traceback.format_exception(
+                exc.exc_type, exc.exc_value, exc.exc_traceback))
+            print(f"\n[FATAL] {exc.thread.name} thread crashed:\n{tb}", flush=True)
+            session_log.log("error", thread=exc.thread.name, traceback=tb)
             # A transient network/API failure shouldn't end commentary for the
             # whole session: relaunch the commentator. Anything else (bad key,
             # 4xx, bugs) stays dead and visible.
@@ -502,17 +562,14 @@ def make_app(args) -> FastAPI:
             config["chattiness"] = body["chattiness"]
             print(f"[config] chattiness -> {config['chattiness']}")
             broadcaster.publish({"type": "config", "chattiness": config["chattiness"]})
+            session_log.log("config", chattiness=config["chattiness"])
         return {"chattiness": config["chattiness"]}
 
     @app.post("/grade")
     async def grade(body: dict):
         c = comments[int(body["id"])]
-        entry = {"graded_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                 "id": c["id"], "comment": c["text"], "comment_ts": c["ts"],
-                 "grade": body["grade"], "note": body.get("note", ""),
-                 "transcript_context": c["context"]}
-        with open(Path(__file__).parent / "grades.jsonl", "a") as f:
-            f.write(json.dumps(entry) + "\n")
+        session_log.log("grade", id=c["id"], comment=c["text"],
+                        grade=body["grade"], note=body.get("note", ""))
         print(f"[grade] #{c['id']} {body['grade']}")
         return {"ok": True}
 
@@ -557,10 +614,8 @@ def main():
                    help="shorthand for --chattiness chatty")
     p.add_argument("--context", metavar="FILE",
                    help="text file with background for the commentator (abstract, curriculum, notes)")
-    p.add_argument("--comment-interval", type=float, default=30.0,
-                   help="max seconds between commentary opportunities")
-    p.add_argument("--lull-sec", type=float, default=4.0,
-                   help="a pause in speech this long triggers an early opportunity")
+    p.add_argument("--call-gap", type=float, default=10.0,
+                   help="min seconds between Claude calls")
     p.add_argument("--min-new-words", type=int, default=30,
                    help="skip commentary unless this many new words arrived")
     p.add_argument("--port", type=int, default=8710)
@@ -573,9 +628,11 @@ def main():
         config["context"] = Path(args.context).read_text()[:8000]
         print(f"[app] context:  {args.context} ({len(config['context'])} chars)")
 
+    session_log.start(args)
     print(f"[app] project:  {Path(__file__).resolve().parent}")
     print(f"[app] display:  http://localhost:{args.port}  (project this)")
     print(f"[app] whisper:  {args.whisper_model} on {args.device}")
+    print(f"[app] log:      {session_log.path}")
     uvicorn.run(make_app(args), host="0.0.0.0", port=args.port, log_level="warning")
 
 
