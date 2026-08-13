@@ -194,7 +194,8 @@ class SessionLog:
         self.path = d / (time.strftime("%Y%m%d-%H%M%S") + ".jsonl")
         self.log("session_start", source=args.wav or "mic", speed=args.speed,
                  model=args.claude_model, effort=args.effort, fast=args.fast,
-                 chattiness=config["chattiness"], whisper=args.whisper_model)
+                 chattiness=config["chattiness"], asr=args.asr,
+                 whisper=args.whisper_model)
 
     def log(self, type_: str, **fields):
         if self.path is None:
@@ -480,7 +481,9 @@ def assemblyai_transcriber_thread(audio_q: queue.Queue, args):
             else:
                 lines.append((spk, [w["text"]]))
         for spk, tokens in lines:
-            who = "SPEAKER" if spk in (None, "UNKNOWN") else spk
+            # PENDING = diarization hasn't settled on these words yet; it can
+            # belong to either the previous or the next speaker, so stay neutral
+            who = "SPEAKER" if spk in (None, "UNKNOWN", "PENDING") else spk
             emit(f"{who}: {' '.join(tokens)}")
 
 
