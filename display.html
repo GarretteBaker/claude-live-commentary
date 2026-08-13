@@ -2,6 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Live Commentary</title>
 <style>
   :root { color-scheme: dark; }
@@ -14,9 +15,10 @@
   #status {
     position: fixed; top: 1rem; right: 1.4rem;
     font: 0.8rem/1 system-ui, sans-serif; color: #4a5262; letter-spacing: 0.08em;
-    text-transform: uppercase;
+    text-transform: uppercase; z-index: 2;
   }
   #status.live { color: #6faf7a; }
+  #status.thinking { color: #c9a45a; }
   #status.crashed { color: #c05a5a; }
   @keyframes pulse {
     0%   { text-shadow: 0 0 0 rgba(232,230,224,0); }
@@ -45,22 +47,56 @@
     font-style: italic; opacity: 0; transition: opacity 1.2s ease;
   }
   #current.shown { opacity: 1; }
+  #current .quote, #history .quote {
+    display: block; font-size: 55%; font-style: normal; color: #8a92a2;
+    border-left: 2px solid #2c3240; padding-left: 0.8em; margin-bottom: 0.6em;
+    line-height: 1.4;
+  }
   #current .ts {
     display: block; margin-top: 1.2rem;
     font: 0.85rem/1 system-ui, sans-serif; font-style: normal; color: #4a5262;
   }
   #history {
-    padding: 0 8vw 2vh; max-height: 28vh; overflow: hidden;
-    display: flex; flex-direction: column-reverse; gap: 0.6rem;
+    padding: 0 8vw 2vh; max-height: 32vh; overflow: hidden;
+    display: flex; flex-direction: column-reverse; gap: 0.7rem;
   }
-  #history div {
-    font-size: clamp(0.85rem, 1.5vw, 1.15rem); color: #6a7180; line-height: 1.35;
+  #history div.item {
+    font-size: clamp(1.05rem, 2vw, 1.5rem); color: #8b93a3; line-height: 1.35;
   }
   #ticker {
     border-top: 1px solid #1c2028; padding: 0.9rem 2vw 1.1rem;
     font: clamp(0.75rem, 1.3vw, 1rem)/1.4 system-ui, sans-serif;
     color: #3d4452; white-space: nowrap; overflow: hidden; text-align: right;
   }
+  /* --- grading (on ?ops or ?grade) --- */
+  .gradebtns { display: inline-flex; gap: 0.5em; margin-left: 0.8em;
+               font-style: normal; vertical-align: middle; }
+  .gradebtns button {
+    background: #161a22; border: 1px solid #2c3240; color: #8a92a2;
+    border-radius: 6px; font-size: 0.95rem; padding: 0.15em 0.5em; cursor: pointer;
+  }
+  .gradebtns button.picked { border-color: #6faf7a; color: #e8e6e0; }
+  .gradebtns button:disabled { cursor: default; opacity: 0.7; }
+  /* --- operator pane (?ops) --- */
+  #ops {
+    position: fixed; top: 0; right: 0; bottom: 0; width: 330px; z-index: 1;
+    background: rgba(12,14,18,0.92); border-left: 1px solid #1c2028;
+    padding: 2.6rem 1.1rem 1rem; overflow-y: auto;
+    font: 0.8rem/1.5 ui-monospace, "JetBrains Mono", monospace; color: #8a92a2;
+  }
+  #ops[hidden] { display: none; }
+  body.ops #top, body.ops #history, body.ops #ticker { margin-right: 330px; }
+  #ops .h { color: #4a5262; text-transform: uppercase; letter-spacing: 0.08em;
+            font-size: 0.7rem; margin: 1.1rem 0 0.3rem; }
+  #ops .h:first-child { margin-top: 0; }
+  #ops-chat button {
+    background: #161a22; border: 1px solid #2c3240; color: #8a92a2;
+    border-radius: 6px; font: inherit; padding: 0.2em 0.7em; cursor: pointer;
+    margin-right: 0.4em;
+  }
+  #ops-chat button.picked { border-color: #c9a45a; color: #e8e6e0; }
+  #ops-passes div { margin-bottom: 0.35rem; }
+  #ops-passes .t { color: #4a5262; }
 </style>
 </head>
 <body>
@@ -74,16 +110,91 @@
   </div>
   <div id="history"></div>
   <div id="ticker"></div>
+  <div id="ops" hidden>
+    <div class="h">pipeline</div>
+    <div id="ops-stage">stage: connecting…</div>
+    <div id="ops-tick">—</div>
+    <div class="h">chattiness</div>
+    <div id="ops-chat">
+      <button data-level="strict">strict</button><button data-level="chatty">chatty</button><button data-level="eager">eager</button>
+    </div>
+    <div class="h">recent passes</div>
+    <div id="ops-passes"></div>
+  </div>
 <script>
   const current = document.getElementById("current");
   const history = document.getElementById("history");
   const ticker  = document.getElementById("ticker");
   const status  = document.getElementById("status");
+  const params  = new URLSearchParams(location.search);
+  const opsOn   = params.has("ops");
+  const gradeOn = opsOn || params.has("grade");
   let tickerText = "";
+  let crashed = false;
+  let lastComment = null;   // {id, text} currently on the big display
+
+  if (opsOn) {
+    document.getElementById("ops").hidden = false;
+    document.body.classList.add("ops");
+  }
+
+  function setStatus(text) {
+    status.textContent = text;
+    crashed = text.includes("crashed");
+    status.classList.toggle("crashed", crashed);
+    status.classList.toggle("thinking", !crashed && text.startsWith("thinking"));
+    status.classList.toggle("live", !crashed && !text.startsWith("thinking"));
+    const opsStage = document.getElementById("ops-stage");
+    if (opsStage) opsStage.textContent = "stage: " + text;
+  }
+
+  // split an optional leading "> quote" line off the comment body
+  function splitComment(text) {
+    const lines = text.split("\n");
+    const quote = lines.filter(l => l.startsWith("> ")).map(l => l.slice(2)).join(" ");
+    const body  = lines.filter(l => !l.startsWith("> ")).join(" ").trim();
+    return { quote, body };
+  }
+
+  function gradeButtons(id) {
+    const span = document.createElement("span");
+    span.className = "gradebtns";
+    [["👍", "up"], ["👎", "down"]].forEach(([face, grade]) => {
+      const b = document.createElement("button");
+      b.textContent = face;
+      b.addEventListener("click", (e) => {
+        e.stopPropagation();
+        fetch("/grade", { method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ id, grade }) });
+        span.querySelectorAll("button").forEach(x => { x.disabled = true; });
+        b.classList.add("picked");
+      });
+      span.append(b);
+    });
+    return span;
+  }
+
+  function renderInto(el, comment, withTs) {
+    el.innerHTML = "";
+    const { quote, body } = splitComment(comment.text);
+    if (quote) {
+      const q = document.createElement("span");
+      q.className = "quote"; q.textContent = "“" + quote + "”";
+      el.append(q);
+    }
+    el.append(document.createTextNode(body));
+    if (gradeOn && comment.id != null) el.append(gradeButtons(comment.id));
+    if (withTs && comment.ts) {
+      const ts = document.createElement("span");
+      ts.className = "ts"; ts.textContent = comment.ts;
+      el.append(ts);
+    }
+  }
 
   const es = new EventSource("/events");
-  es.onopen  = () => { status.textContent = "live"; status.classList.add("live"); };
-  es.onerror = () => { status.textContent = "reconnecting…"; status.classList.remove("live"); };
+  es.onopen  = () => setStatus("live");
+  es.onerror = () => { if (!crashed) setStatus("reconnecting…"); };
 
   es.onmessage = (m) => {
     const ev = JSON.parse(m.data);
@@ -91,25 +202,23 @@
       tickerText = (tickerText + " " + ev.text).slice(-300);
       ticker.textContent = tickerText;
     } else if (ev.type === "comment") {
-      const hadPrevious = current.textContent.trim().length > 0;
-      if (hadPrevious) {
+      if (lastComment) {
         const d = document.createElement("div");
-        d.textContent = current.firstChild ? current.firstChild.textContent : "";
+        d.className = "item";
+        renderInto(d, lastComment, false);
         history.prepend(d);
         while (history.childElementCount > 6) history.lastChild.remove();
       }
       const show = () => {
-        current.innerHTML = "";
-        current.append(document.createTextNode(ev.text));
-        const ts = document.createElement("span");
-        ts.className = "ts"; ts.textContent = ev.ts || "";
-        current.append(ts);
+        renderInto(current, ev, true);
         current.classList.add("shown");
         current.classList.remove("pulse");
         void current.offsetWidth;  // restart the animation
         current.classList.add("pulse");
         if (ev.ts) chime();  // replayed history has no timestamp -> silent
       };
+      const hadPrevious = lastComment !== null;
+      lastComment = { id: ev.id, text: ev.text };
       if (hadPrevious) {
         current.classList.remove("shown");
         setTimeout(show, 250);
@@ -117,15 +226,43 @@
         show();
       }
     } else if (ev.type === "status") {
-      status.textContent = ev.text;
-      status.classList.toggle("crashed", ev.text.includes("crashed"));
-      status.classList.toggle("live", !ev.text.includes("crashed"));
+      setStatus(ev.text);
+    } else if (ev.type === "stage") {
+      if (!crashed) setStatus(ev.text === "listening" ? "live" : ev.text);
+    } else if (ev.type === "tick" && opsOn) {
+      const wordsOk = ev.new_words >= ev.need_words ? "✓" : "✗";
+      document.getElementById("ops-tick").textContent =
+        `${ev.new_words}/${ev.need_words} new words ${wordsOk} · ` +
+        `lull ${ev.lull}s/${ev.need_lull}s · interval fires ≤${ev.next_due}s`;
+    } else if (ev.type === "pass" && opsOn) {
+      const d = document.createElement("div");
+      d.innerHTML = `<span class="t">${ev.ts} (${ev.dt}s)</span> `;
+      d.append(document.createTextNode(ev.text || "(no reason given)"));
+      const passes = document.getElementById("ops-passes");
+      passes.prepend(d);
+      while (passes.childElementCount > 10) passes.lastChild.remove();
+    } else if (ev.type === "config") {
+      markChattiness(ev.chattiness);
     }
   };
 
+  // chattiness controls (ops pane) — live retuning via POST /config
+  function markChattiness(level) {
+    document.querySelectorAll("#ops-chat button").forEach(b =>
+      b.classList.toggle("picked", b.dataset.level === level));
+  }
+  if (opsOn) {
+    fetch("/config").then(r => r.json()).then(c => markChattiness(c.chattiness));
+    document.querySelectorAll("#ops-chat button").forEach(b =>
+      b.addEventListener("click", () =>
+        fetch("/config", { method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ chattiness: b.dataset.level }) })));
+  }
+
   // Opt-in chime: open the page as /?chime (browsers require a click first
   // to unlock audio, so click anywhere on the page once after loading).
-  const chimeOn = new URLSearchParams(location.search).has("chime");
+  const chimeOn = params.has("chime");
   let audioCtx = null;
   document.addEventListener("click", () => {
     if (chimeOn && !audioCtx) audioCtx = new AudioContext();

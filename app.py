@@ -56,11 +56,24 @@ Useful interventions:
 - proposing a compact example or counterexample;
 - supplying a crisp relevant fact, standard term, or canonical reference.
 
-Most turns should be PASS. When you decline, reply "PASS | <ten-word reason>" so the operator can tune the system; the reason is never projected. Otherwise output only the comment text — no preamble, quotes, or markdown."""
+Two refinements:
+- You may open a comment with one short verbatim quote of the transcript words you are responding to, on its own line formatted as "> their words". Quote only when it clarifies what the comment attaches to; the quote does not count toward the word limit.
+- If the room addresses you directly (e.g. "Claude", "the screen", "the commentary") or explicitly poses a question for you to answer, answer it — this outranks the PASS criteria, and the answer may run to 80 words.
 
-CHATTY_ADDENDUM = """
+Most turns should be PASS. When you decline, reply "PASS | <ten-word reason>" so the operator can tune the system; the reason is never projected. Otherwise output only the comment text (with its optional quote line) — no preamble or markdown."""
 
-Demo mode: lower the bar. Comment whenever there is any substantive claim, question, or disagreement you can engage with — roughly every other opportunity. Reserve PASS for pure logistics, small talk, or unintelligible audio."""
+CHATTINESS_ADDENDA = {
+    "strict": "",
+    "chatty": """
+
+Demo mode: lower the bar. Comment whenever there is any substantive claim, question, or disagreement you can engage with — roughly every other opportunity. Reserve PASS for pure logistics, small talk, or unintelligible audio.""",
+    "eager": """
+
+Eager mode: comment at nearly every opportunity — any claim, question, definition, or example is fair game. PASS only when nothing new was said or the audio is unintelligible.""",
+}
+
+# mutable at runtime: the operator page (/?ops) can retune chattiness live
+config = {"chattiness": "strict", "context": ""}
 
 
 # ---------------------------------------------------------------- gpu setup
@@ -181,7 +194,11 @@ class Broadcaster:
 
 transcript = Transcript()
 broadcaster = Broadcaster()
-comments: list[str] = []
+comments: list[dict] = []  # {"id", "text", "ts", "context"}
+# handshake for pulling the partially-filled audio chunk through whisper
+# right before a Claude call, so the prompt includes the freshest words
+flush_req = threading.Event()
+flush_done = threading.Event()
 # populated at startup when the source is a YouTube URL, so the display
 # page can embed the video synced to the audio feed
 meta = {"youtube_id": None, "speed": 1.0, "started_at": None}
@@ -257,16 +274,12 @@ def transcriber_thread(audio_q: queue.Queue, args):
     buf = bytearray()
     chunk_bytes = int(BYTES_PER_SEC * args.chunk_sec)
     prev_plain = ""  # label-free tail for whisper's initial_prompt
-    while True:
-        buf.extend(audio_q.get())
-        if len(buf) < chunk_bytes:
-            continue
-        audio = np.frombuffer(bytes(buf), dtype=np.int16).astype(np.float32) / 32768.0
-        buf.clear()
 
+    def process(raw: bytes):
+        nonlocal prev_plain
+        audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
         if np.sqrt(np.mean(audio**2)) < 0.0015:  # silence gate
-            continue
-
+            return
         t0 = time.monotonic()
         segments, _info = model.transcribe(
             audio, language=args.language, vad_filter=True,
@@ -284,7 +297,7 @@ def transcriber_thread(audio_q: queue.Queue, args):
                 lines.append((who, text))
         dt = time.monotonic() - t0
         if not lines:
-            continue
+            return
         prev_plain = " ".join(text for _who, text in lines)
         for who, text in lines:
             line = f"{who}: {text}" if who else text
@@ -292,25 +305,46 @@ def transcriber_thread(audio_q: queue.Queue, args):
             print(f"[asr] ({dt:.2f}s) {line}")
             broadcaster.publish({"type": "transcript", "text": line})
 
+    while True:
+        buf.extend(audio_q.get())
+        if flush_req.is_set():
+            flush_req.clear()
+            if len(buf) >= BYTES_PER_SEC:  # ≥1 s pending: transcribe it early
+                process(bytes(buf))
+                buf.clear()
+            flush_done.set()
+        if len(buf) >= chunk_bytes:
+            process(bytes(buf))
+            buf.clear()
+
 
 # ---------------------------------------------------------------- commentary
 
 def build_user_prompt() -> str:
     text = transcript.text()[-12000:]  # rolling window
-    prev = "\n".join(f"- {c}" for c in comments[-10:]) or "(none)"
+    prev = "\n".join(f"- {c['text']}" for c in comments[-10:]) or "(none)"
     return (f"Your previous comments:\n{prev}\n\n"
             f"Rolling transcript (most recent speech last):\n{text}\n\n"
             f"Reply with PASS or one comment.")
 
 
+def build_system_prompt() -> str:
+    system = COMMENTATOR_SYSTEM + CHATTINESS_ADDENDA[config["chattiness"]]
+    if config["context"]:
+        system += ("\n\nBackground provided by the operator (abstract, "
+                   "curriculum, notes) — use it to sharpen comments, never "
+                   "comment on it directly:\n" + config["context"])
+    return system
+
+
 def ask_claude(client, args) -> str:
     response = client.beta.messages.create(
         model=args.claude_model,
-        max_tokens=300,
+        max_tokens=500,
         betas=["server-side-fallback-2026-07-01"],
         fallbacks="default",
         output_config={"effort": args.effort},
-        system=COMMENTATOR_SYSTEM + (CHATTY_ADDENDUM if args.chatty else ""),
+        system=build_system_prompt(),
         messages=[{"role": "user", "content": build_user_prompt()}],
     )
     if response.stop_reason == "refusal":
@@ -319,9 +353,9 @@ def ask_claude(client, args) -> str:
 
 
 MOCK_COMMENTS = iter([
-    "PASS",
-    "Hidden assumption: that group discussion quality is measured against a solo-LLM baseline rather than against the group's own counterfactual.",
-    "PASS",
+    "PASS | warming up, nothing substantive yet",
+    "> group discussion quality\nHidden assumption: quality is measured against a solo-LLM baseline rather than the group's own counterfactual.",
+    "PASS | mock pass to exercise the operator pane",
     "Two senses of 'better than an LLM': content coverage vs. shared attention. The disagreement may only concern the first.",
 ])
 
@@ -336,34 +370,56 @@ def commentator_thread(args):
     seen_words = 0
     last_fire = time.monotonic()
     while True:
-        time.sleep(2.0)
+        time.sleep(1.0)
         now = time.monotonic()
         # Fire on a lull in speech (comment lands when eyes can go to the
         # screen) or when the interval has elapsed, but only given new speech.
         lull = now - transcript.last_append >= args.lull_sec
         due = now - last_fire >= args.comment_interval
+        n = transcript.word_count()
+        broadcaster.publish({
+            "type": "tick",
+            "new_words": n - seen_words, "need_words": args.min_new_words,
+            "lull": round(now - transcript.last_append, 1), "need_lull": args.lull_sec,
+            "next_due": max(0, round(args.comment_interval - (now - last_fire))),
+        })
         if not (lull or due):
             continue
-        n = transcript.word_count()
         if n - seen_words < args.min_new_words:
             continue
-        last_fire = now
-        seen_words = n
 
+        # pull the partially-filled audio chunk through whisper first, so
+        # Claude sees the freshest words rather than a chunk-boundary-stale view
+        flush_done.clear()
+        flush_req.set()
+        flush_done.wait(timeout=3.0)
+
+        last_fire = time.monotonic()
+        seen_words = transcript.word_count()
+
+        broadcaster.publish({"type": "stage", "text": "thinking…"})
         t0 = time.monotonic()
         if args.mock:
             reply = next(MOCK_COMMENTS, "PASS")
         else:
             reply = ask_claude(client, args)
         dt = time.monotonic() - t0
+        broadcaster.publish({"type": "stage", "text": "listening"})
 
         trigger = "lull" if lull else "interval"
         print(f"[claude] ({dt:.1f}s, {trigger}) {reply}")
         if reply.strip().upper().startswith("PASS"):
+            reason = reply.split("|", 1)[1].strip() if "|" in reply else ""
+            broadcaster.publish({"type": "pass", "text": reason,
+                                 "ts": time.strftime("%H:%M:%S"), "dt": round(dt, 1)})
             continue
-        comments.append(reply)
-        broadcaster.publish({"type": "comment", "text": reply,
-                             "ts": time.strftime("%H:%M:%S")})
+        comment = {"id": len(comments), "text": reply,
+                   "ts": time.strftime("%H:%M:%S"),
+                   "context": transcript.text()[-1500:]}
+        comments.append(comment)
+        broadcaster.publish({"type": "comment", "id": comment["id"],
+                             "text": comment["text"], "ts": comment["ts"],
+                             "dt": round(dt, 1)})
 
 
 # ---------------------------------------------------------------- web
@@ -436,13 +492,38 @@ def make_app(args) -> FastAPI:
     async def get_meta():
         return meta
 
+    @app.get("/config")
+    async def get_config():
+        return {"chattiness": config["chattiness"]}
+
+    @app.post("/config")
+    async def set_config(body: dict):
+        if body.get("chattiness") in CHATTINESS_ADDENDA:
+            config["chattiness"] = body["chattiness"]
+            print(f"[config] chattiness -> {config['chattiness']}")
+            broadcaster.publish({"type": "config", "chattiness": config["chattiness"]})
+        return {"chattiness": config["chattiness"]}
+
+    @app.post("/grade")
+    async def grade(body: dict):
+        c = comments[int(body["id"])]
+        entry = {"graded_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                 "id": c["id"], "comment": c["text"], "comment_ts": c["ts"],
+                 "grade": body["grade"], "note": body.get("note", ""),
+                 "transcript_context": c["context"]}
+        with open(Path(__file__).parent / "grades.jsonl", "a") as f:
+            f.write(json.dumps(entry) + "\n")
+        print(f"[grade] #{c['id']} {body['grade']}")
+        return {"ok": True}
+
     @app.get("/events")
     async def events():
         async def gen():
             q = broadcaster.subscribe()
             # replay context for late joiners
             for c in comments[-5:]:
-                yield f"data: {json.dumps({'type': 'comment', 'text': c, 'ts': ''})}\n\n"
+                yield ("data: " + json.dumps({"type": "comment", "id": c["id"],
+                                              "text": c["text"], "ts": ""}) + "\n\n")
             while True:
                 event = await q.get()
                 yield f"data: {json.dumps(event)}\n\n"
@@ -468,9 +549,14 @@ def main():
                    help="disable speaker labeling (skips the ECAPA model)")
     p.add_argument("--chunk-sec", type=float, default=7.0, help="transcription chunk length")
     p.add_argument("--claude-model", default="claude-opus-5")
-    p.add_argument("--effort", default="medium", choices=["low", "medium", "high"])
+    p.add_argument("--effort", default="medium", choices=["low", "medium", "high"],
+                   help="Claude reasoning effort; low is the main latency lever")
+    p.add_argument("--chattiness", choices=list(CHATTINESS_ADDENDA), default="strict",
+                   help="how low the commentary bar starts (retunable live from /?ops)")
     p.add_argument("--chatty", action="store_true",
-                   help="lower the commentary bar (good for demos/testing)")
+                   help="shorthand for --chattiness chatty")
+    p.add_argument("--context", metavar="FILE",
+                   help="text file with background for the commentator (abstract, curriculum, notes)")
     p.add_argument("--comment-interval", type=float, default=30.0,
                    help="max seconds between commentary opportunities")
     p.add_argument("--lull-sec", type=float, default=4.0,
@@ -482,6 +568,10 @@ def main():
 
     ensure_cuda_libs()
     args.device = resolve_device(args.device)
+    config["chattiness"] = "chatty" if args.chatty and args.chattiness == "strict" else args.chattiness
+    if args.context:
+        config["context"] = Path(args.context).read_text()[:8000]
+        print(f"[app] context:  {args.context} ({len(config['context'])} chars)")
 
     print(f"[app] project:  {Path(__file__).resolve().parent}")
     print(f"[app] display:  http://localhost:{args.port}  (project this)")
