@@ -101,10 +101,22 @@
   .note.ask::before { content: "?  "; font-weight: 700; }
   /* reader marginalia: same hand as Marginalia, graphite and smaller */
   .note.reader { color: #6b6458; }
-  /* endnote thread affordances */
-  .note .threadmark {
-    cursor: pointer; color: #a03d2e; font-weight: 700;
-    vertical-align: super; font-size: 70%; margin-left: 0.15em;
+  /* endnote threads announce themselves as bookmarks poking out of the
+     book's right edge at their note's height */
+  .bookmark {
+    position: absolute; right: 0; z-index: 4; cursor: pointer;
+    background: var(--ribbon, #8e3b2f); color: #f6f1e4;
+    font: 600 0.72rem system-ui, sans-serif; letter-spacing: 0.06em;
+    padding: 0.4em 1em 0.4em 1.3em; white-space: nowrap;
+    clip-path: polygon(15px 0, 100% 0, 100% 100%, 15px 100%, 0 50%);
+    box-shadow: 0 2px 7px rgba(60,50,30,0.3); opacity: 0.87;
+    transition: top 0.45s ease, transform 0.2s ease, opacity 0.2s ease;
+  }
+  .bookmark:hover { opacity: 1; transform: translateX(-6px); }
+  .bookmark.active { opacity: 1; transform: translateX(-12px); }
+  .bookmark .bcount {
+    background: rgba(255,255,255,0.28); border-radius: 9px;
+    padding: 0 0.5em; margin-left: 0.55em; font-size: 0.66rem;
   }
   .note .replybtn {
     opacity: 0; cursor: pointer; border: none; background: none;
@@ -472,7 +484,8 @@
     }
     pencil.style.top = Math.max(anchorY(null), y) + "px";
     bookEl.style.minHeight = Math.max(textEl.offsetHeight, y) + 300 + "px";
-    positionEndnote();   // the bookmark follows its note when notes restack
+    positionEndnote();   // card and bookmarks follow their notes on restacks
+    positionBookmarks();
     if (pinned) window.scrollTo({ top: document.body.scrollHeight });
   }
   // webfonts (and font cycling) change note heights after they were measured
@@ -561,15 +574,48 @@
     note.el.append(b);
   }
 
-  function setThreadmark(tid) {
-    const t = threadsC[tid];
-    const note = noteByKey[t.root_kind + ":" + t.root_id];
-    if (!note || note.el.querySelector(".threadmark")) return;
-    const mark = document.createElement("span");
-    mark.className = "threadmark"; mark.textContent = sup(tid);
-    mark.title = "open endnote " + tid;
-    mark.addEventListener("click", () => openEndnote(tid));
-    note.el.append(mark);
+  const bookmarks = {};   // tid -> ribbon element at the page's right edge
+
+  function createBookmark(tid) {
+    if (bookmarks[tid]) return;
+    const b = document.createElement("div");
+    b.className = "bookmark";
+    const label = document.createElement("span");
+    label.textContent = "Endnote " + sup(tid);
+    const count = document.createElement("span");
+    count.className = "bcount";
+    count.textContent = (threadsC[tid]?.msgs || []).length || "";
+    b.append(label, count);
+    b.addEventListener("click", () =>
+      openTid === tid ? closeEndnote() : openEndnote(tid));
+    document.body.append(b);
+    bookmarks[tid] = b;
+    positionBookmarks();
+  }
+
+  // bookmarks sit at their note's height, pushed down past one another
+  function positionBookmarks() {
+    const items = Object.keys(bookmarks).map(Number).map(tid => {
+      const t = threadsC[tid];
+      const root = t && noteByKey[t.root_kind + ":" + t.root_id];
+      return { tid, top: root
+        ? root.el.getBoundingClientRect().top + window.scrollY : 80 };
+    }).sort((a, b) => a.top - b.top);
+    let yy = 0;
+    for (const it of items) {
+      const el = bookmarks[it.tid];
+      const top = Math.max(it.top, yy);
+      el.style.top = top + "px";
+      el.classList.toggle("active", openTid === it.tid);
+      yy = top + el.offsetHeight + 6;
+    }
+  }
+
+  function closeEndnote() {
+    document.getElementById("endnote").classList.remove("open");
+    document.getElementById("en-ribbon").style.display = "none";
+    openTid = null;
+    positionBookmarks();
   }
 
   function openEndnote(tid) {
@@ -584,6 +630,7 @@
     renderEndnoteMsgs();
     document.getElementById("endnote").classList.add("open");
     positionEndnote();
+    positionBookmarks();
     document.getElementById("en-input").focus();
   }
 
@@ -628,11 +675,7 @@
     box.scrollTop = box.scrollHeight;
   }
 
-  document.querySelector("#endnote .close").addEventListener("click", () => {
-    document.getElementById("endnote").classList.remove("open");
-    document.getElementById("en-ribbon").style.display = "none";
-    openTid = null;
-  });
+  document.querySelector("#endnote .close").addEventListener("click", closeEndnote);
   document.getElementById("en-input").addEventListener("keydown", (k) => {
     const input = k.target;
     if (k.key !== "Enter" || !input.value.trim() || openTid === null) return;
@@ -732,10 +775,12 @@
         { root_kind: ev.root_kind, root_id: ev.root_id, msgs: [] };
       threadsC[ev.tid].root_kind = ev.root_kind;
       threadsC[ev.tid].root_id = ev.root_id;
-      setThreadmark(ev.tid);
+      createBookmark(ev.tid);
     } else if (ev.type === "thread_msg") {
       if (!threadsC[ev.tid]) threadsC[ev.tid] = { root_kind: null, root_id: null, msgs: [] };
       threadsC[ev.tid].msgs.push(ev);
+      const bc = bookmarks[ev.tid]?.querySelector(".bcount");
+      if (bc) bc.textContent = threadsC[ev.tid].msgs.length;
       if (openTid === ev.tid) renderEndnoteMsgs();
     } else if (ev.type === "comment_start") {
       pencil.classList.remove("on");
