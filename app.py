@@ -313,17 +313,14 @@ energy_lock = threading.Lock()
 mic_map = {"names": []}                # non-empty => hardware attribution on
 
 
-def channel_for_span(a_ms: float, b_ms: float, floor: float) -> int | None:
+def channel_for_span(a_ms: float, b_ms: float) -> int:
     f0 = int(a_ms // ENERGY_FRAME_MS)
     f1 = max(f0 + 1, int(b_ms // ENERGY_FRAME_MS))
     with energy_lock:
         window = energy_frames[f0:f1]
-    if not window:
-        return None
-    e = np.mean(window, axis=0)
-    if float(e.max()) < floor:
-        return None
-    return int(e.argmax())
+    if not window:   # startup edge: no frames yet
+        return 0
+    return int(np.mean(window, axis=0).argmax())
 
 
 def ts_for_ms(ms: float) -> str:
@@ -578,8 +575,7 @@ def assemblyai_transcriber_thread(audio_q: queue.Queue, args):
         # revision lane rewrites these lines); PENDING/quiet = neutral
         def who_of(w) -> str:
             if mic_map["names"]:
-                ch = channel_for_span(w["start"], w["end"], args.gate_rms)
-                return mic_map["names"][ch].lower() if ch is not None else "speaker"
+                return mic_map["names"][channel_for_span(w["start"], w["end"])].lower()
             spk = w.get("speaker")
             return ("speaker" if spk in (None, "UNKNOWN", "PENDING")
                     else spk.lower())
@@ -701,9 +697,8 @@ def scribe_revision_thread(args):
             # hardware attribution: whoever's mic was loudest owns the words
             # (including audio events — the laugher's mic hears it loudest)
             def settled_who(w) -> str:
-                ch = channel_for_span(t0 + w["start"] * 1000,
-                                      t0 + w["end"] * 1000, args.gate_rms)
-                return mic_map["names"][ch].upper() if ch is not None else "SPEAKER"
+                ch = channel_for_span(t0 + w["start"] * 1000, t0 + w["end"] * 1000)
+                return mic_map["names"][ch].upper()
         else:
             # per-speaker voice samples for identity stitching (≤8 s each)
             voice: dict[str, list[bytes]] = {}
@@ -841,7 +836,9 @@ def build_system_prompt() -> str:
             "described above, the lowercase and UPPERCASE forms of a label are "
             "the SAME person (lowercase only means the text has not been revised "
             "yet). Speakers in mic order: " + ", ".join(mic_map["names"]) + ". "
-            "A label of 'speaker'/'SPEAKER' means no mic clearly owned the words.")
+            "Speech from anyone without a mic is attributed to whichever mic "
+            "heard it loudest — read attributions of clearly-different voices "
+            "with that in mind.")
     if config["context"]:
         system += ("\n\nBackground provided by the operator (abstract, "
                    "curriculum, notes) — use it to sharpen comments, never "
@@ -1255,9 +1252,6 @@ def main():
                         "that person and speaker attribution becomes hardware "
                         "truth (loudest mic owns the words). Defaults to letters "
                         "when several mics are captured")
-    p.add_argument("--gate-rms", type=float, default=150.0,
-                   help="per-channel RMS below which a word's timespan counts as "
-                        "silence for mic attribution")
     p.add_argument("--mock", action="store_true", help="canned comments instead of the Claude API")
     p.add_argument("--asr", default="auto",
                    choices=["auto", "whisper", "deepgram", "assemblyai"],
