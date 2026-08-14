@@ -1270,8 +1270,18 @@ def main():
     asr_desc = {"deepgram": "deepgram nova-3 (streaming diarization)",
                 "assemblyai": "assemblyai universal-3-5-pro (streaming diarization)",
                 }.get(args.asr, f"whisper {args.whisper_model} on {args.device}")
+    if not args.mic and not args.wav:
+        # zero-config hardware: capture every plugged-in audio-interface mic
+        # input (e.g. both channels of each Volt 2) and mix them
+        out = subprocess.run(["pactl", "list", "sources", "short"],
+                             capture_output=True, text=True).stdout
+        args.mic = [l.split("\t")[1] for l in out.splitlines()
+                    if "alsa_input.usb-" in l] or None
+        if args.mic:
+            print(f"[app] mics:     auto-detected {len(args.mic)} USB mic inputs")
     if args.mic:
-        print(f"[app] mics:     {len(args.mic)} sources mixed: {', '.join(args.mic)}")
+        for m in args.mic:
+            print(f"[app]   mic:    {m}")
     print(f"[app] asr:      {asr_desc}")
     print(f"[app] revise:   " + (f"scribe_v2 every {args.revise_sec:.0f}s "
                                  "(settled UPPERCASE letters, [laughter] tags)"
