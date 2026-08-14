@@ -129,21 +129,39 @@
     color: #6b6458; font: inherit; }
   #annotate input { background: none; border: none; border-bottom: 1px solid #d8cdb4;
     color: #4a4336; font: inherit; width: 260px; padding: 0.1em 0.2em; }
-  /* the endnote panel: a side conversation, one per marked note */
-  #endnote {
-    position: fixed; top: 0; right: -440px; bottom: 0; width: 410px; z-index: 6;
-    background: var(--paper); border-left: 1px solid #d8cdb4;
-    box-shadow: -6px 0 22px rgba(60,50,30,0.13); transition: right 0.3s ease;
-    display: flex; flex-direction: column; padding: 1.1rem 1.3rem;
+  /* the endnote: a bookmark card pinned at its note's height, joined to the
+     note by a ribbon across the gutter — an extension of the margin note
+     that lives in the page (it scrolls with the book) */
+  :root { --ribbon: #8e3b2f; }
+  #en-ribbon {
+    position: absolute; background: var(--ribbon); opacity: 0.55;
+    z-index: 5; display: none; border-radius: 2px;
+    box-shadow: 0 1px 3px rgba(60,50,30,0.25);
   }
-  #endnote.open { right: 0; }
-  #endnote h3 { font: 600 0.8rem system-ui, sans-serif; color: var(--pencil);
-    letter-spacing: 0.12em; text-transform: uppercase; margin-bottom: 0.5rem; }
-  #endnote .close { position: absolute; top: 0.8rem; right: 1rem; cursor: pointer;
+  #endnote {
+    position: absolute; right: 12px; width: 360px; z-index: 6;
+    background: #f4eedd; border: 1px solid #ddd2ba; border-top: 4px solid var(--ribbon);
+    border-radius: 3px; box-shadow: 0 4px 20px rgba(60,50,30,0.16);
+    display: none; flex-direction: column; padding: 0.9rem 1.1rem 0.8rem;
+    max-height: 74vh; transform: rotate(0.3deg);
+  }
+  #endnote.open { display: flex; animation: unfurl 0.25s ease-out; }
+  @keyframes unfurl {
+    from { opacity: 0; transform: translateX(-18px) rotate(0.3deg); }
+    to   { opacity: 1; transform: rotate(0.3deg); }
+  }
+  #endnote::before {   /* the bookmark ribbon's tail over the top edge */
+    content: ""; position: absolute; top: -18px; left: 24px;
+    width: 24px; height: 24px; background: var(--ribbon);
+    clip-path: polygon(0 0, 100% 0, 100% 100%, 50% 62%, 0 100%);
+  }
+  #endnote h3 { font: 600 0.75rem system-ui, sans-serif; color: var(--ribbon);
+    letter-spacing: 0.12em; text-transform: uppercase; margin-bottom: 0.45rem; }
+  #endnote .close { position: absolute; top: 0.6rem; right: 0.8rem; cursor: pointer;
     border: none; background: none; color: var(--pencil); font-size: 1rem; }
   #en-root { font: italic 0.85rem Georgia, serif; color: #8a8172;
-    border-bottom: 1px solid #e8dfcc; padding-bottom: 0.55rem; margin-bottom: 0.7rem; }
-  #en-msgs { flex: 1; overflow-y: auto; }
+    border-bottom: 1px solid #e8dfcc; padding-bottom: 0.5rem; margin-bottom: 0.6rem; }
+  #en-msgs { flex: 1; overflow-y: auto; min-height: 2rem; }
   #en-msgs .m { margin-bottom: 0.75rem; line-height: 1.25; }
   #en-msgs .m .mwho { display: block; font: 0.6rem system-ui, sans-serif;
     color: #b8ad97; letter-spacing: 0.08em; text-transform: uppercase; }
@@ -219,6 +237,7 @@
   </div>
   <button id="texttoggle" title="also: press t">¶ text</button>
   <div id="annotate"></div>
+  <div id="en-ribbon"></div>
   <div id="endnote">
     <button class="close">✕</button>
     <h3 id="en-title">Endnote</h3>
@@ -453,6 +472,7 @@
     }
     pencil.style.top = Math.max(anchorY(null), y) + "px";
     bookEl.style.minHeight = Math.max(textEl.offsetHeight, y) + 300 + "px";
+    positionEndnote();   // the bookmark follows its note when notes restack
     if (pinned) window.scrollTo({ top: document.body.scrollHeight });
   }
   // webfonts (and font cycling) change note heights after they were measured
@@ -563,7 +583,34 @@
         .slice(0, 160);
     renderEndnoteMsgs();
     document.getElementById("endnote").classList.add("open");
+    positionEndnote();
     document.getElementById("en-input").focus();
+  }
+
+  // pin the card at its note's height and lay the ribbon across the gutter,
+  // so the thread reads as an extension of the note it grew from
+  function positionEndnote() {
+    if (openTid === null) return;
+    const t = threadsC[openTid];
+    const root = noteByKey[t.root_kind + ":" + t.root_id];
+    const panel = document.getElementById("endnote");
+    const ribbon = document.getElementById("en-ribbon");
+    if (!root) {
+      panel.style.top = (window.scrollY + 80) + "px";
+      ribbon.style.display = "none";
+      return;
+    }
+    // hang the card just below its note, offset right; the ribbon runs
+    // straight up from the card's tail into the note it grew from
+    const r = root.el.getBoundingClientRect();
+    const top = r.bottom + window.scrollY + 10;
+    panel.style.top = top + "px";
+    const pr = panel.getBoundingClientRect();
+    ribbon.style.display = "block";
+    ribbon.style.left = (pr.left + window.scrollX + 30) + "px";
+    ribbon.style.top = (r.top + window.scrollY + 8) + "px";
+    ribbon.style.width = "7px";
+    ribbon.style.height = Math.max(0, top - (r.top + window.scrollY) - 6) + "px";
   }
 
   function renderEndnoteMsgs() {
@@ -583,6 +630,7 @@
 
   document.querySelector("#endnote .close").addEventListener("click", () => {
     document.getElementById("endnote").classList.remove("open");
+    document.getElementById("en-ribbon").style.display = "none";
     openTid = null;
   });
   document.getElementById("en-input").addEventListener("keydown", (k) => {
