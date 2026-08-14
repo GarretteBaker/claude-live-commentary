@@ -115,18 +115,27 @@ def resolve_device(choice: str) -> str:
 
 # ---------------------------------------------------------------- audio
 
-def mic_pcm_blocks(block_sec: float):
-    proc = subprocess.Popen(
-        ["parecord", "--raw", "--format=s16le",
-         f"--rate={SAMPLE_RATE}", "--channels=1"],
-        stdout=subprocess.PIPE,
-    )
+def mic_pcm_blocks(block_sec: float, sources: list[str] | None = None):
+    """One parecord per source, mixed to mono. PipeWire clocks every source
+    to the same graph, so parallel captures stay sample-synced — no drift
+    between two USB interfaces."""
+    cmd = ["parecord", "--raw", "--format=s16le",
+           f"--rate={SAMPLE_RATE}", "--channels=1"]
+    procs = [subprocess.Popen(cmd + ([f"--device={s}"] if s else []),
+                              stdout=subprocess.PIPE)
+             for s in (sources or [None])]
     n = int(BYTES_PER_SEC * block_sec)
     while True:
-        data = proc.stdout.read(n)
-        if not data:
+        bufs = [p.stdout.read(n) for p in procs]
+        if any(not b for b in bufs):
             return
-        yield data
+        if len(bufs) == 1:
+            yield bufs[0]
+            continue
+        m = min(len(b) for b in bufs)
+        mix = np.sum([np.frombuffer(b[:m], np.int16).astype(np.int32)
+                      for b in bufs], axis=0)
+        yield np.clip(mix, -32768, 32767).astype(np.int16).tobytes()
 
 
 def file_pcm_blocks(source: str, speed: float, block_sec: float):
@@ -986,7 +995,7 @@ def make_app(args) -> FastAPI:
                 meta.update(youtube_id=yt.group(1), speed=args.speed,
                             started_at=time.time())
         else:
-            blocks = mic_pcm_blocks(0.5)
+            blocks = mic_pcm_blocks(0.5, args.mic)
 
         audio_meta["speed"] = args.speed if args.wav else 1.0
 
@@ -1179,6 +1188,11 @@ def main():
     p.add_argument("--wav", "--input", dest="wav", metavar="FILE_OR_URL",
                    help="audio/video file or YouTube/etc. URL to simulate a live feed from (mic if omitted)")
     p.add_argument("--speed", type=float, default=1.0, help="playback speed for --wav")
+    p.add_argument("--mic", action="append", metavar="SOURCE",
+                   help="PulseAudio/PipeWire source name; repeat the flag to mix "
+                        "several (e.g. two USB interfaces) into one mono feed. "
+                        "Default: the system default source. List sources with: "
+                        "pactl list sources short")
     p.add_argument("--mock", action="store_true", help="canned comments instead of the Claude API")
     p.add_argument("--asr", default="auto",
                    choices=["auto", "whisper", "deepgram", "assemblyai"],
@@ -1256,6 +1270,8 @@ def main():
     asr_desc = {"deepgram": "deepgram nova-3 (streaming diarization)",
                 "assemblyai": "assemblyai universal-3-5-pro (streaming diarization)",
                 }.get(args.asr, f"whisper {args.whisper_model} on {args.device}")
+    if args.mic:
+        print(f"[app] mics:     {len(args.mic)} sources mixed: {', '.join(args.mic)}")
     print(f"[app] asr:      {asr_desc}")
     print(f"[app] revise:   " + (f"scribe_v2 every {args.revise_sec:.0f}s "
                                  "(settled UPPERCASE letters, [laughter] tags)"
