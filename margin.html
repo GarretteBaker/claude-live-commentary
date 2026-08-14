@@ -252,7 +252,7 @@
   <div id="en-ribbon"></div>
   <div id="endnote">
     <button class="close">✕</button>
-    <h3 id="en-title">Endnote</h3>
+    <h3 id="en-title">Aside</h3>
     <div id="en-root"></div>
     <div id="en-msgs"></div>
     <input id="en-input" placeholder="reply… (Enter to send)">
@@ -550,7 +550,7 @@
     note.rootKind = kind; note.rootId = id;
     noteByKey[kind + ":" + id] = note;
     const b = document.createElement("button");
-    b.className = "replybtn"; b.textContent = "↩"; b.title = "reply (opens an endnote)";
+    b.className = "replybtn"; b.textContent = "↩"; b.title = "reply (opens an aside)";
     b.addEventListener("click", () => {
       if (note.el.querySelector(".replyinput")) return;
       const input = document.createElement("input");
@@ -581,7 +581,7 @@
     const b = document.createElement("div");
     b.className = "bookmark";
     const label = document.createElement("span");
-    label.textContent = "Endnote " + sup(tid);
+    label.textContent = "Aside " + sup(tid);
     const count = document.createElement("span");
     count.className = "bcount";
     count.textContent = (threadsC[tid]?.msgs || []).length || "";
@@ -622,7 +622,7 @@
     if (!threadsC[tid]) threadsC[tid] = { root_kind: null, root_id: null, msgs: [] };
     openTid = tid;
     const t = threadsC[tid];
-    document.getElementById("en-title").textContent = "Endnote " + sup(tid);
+    document.getElementById("en-title").textContent = "Aside " + sup(tid);
     const root = noteByKey[t.root_kind + ":" + t.root_id];
     document.getElementById("en-root").textContent = !root ? "" :
       [...root.bodyEl.querySelectorAll(".w")].map(w => w.textContent).join(" ")

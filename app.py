@@ -67,7 +67,7 @@ The room can vote on your notes; previous notes may carry tallies like [2↑ 1�
 
 You always see the full session transcript. If the room explicitly asks you to search or look something up ("Marginalia, search for…", "chat, look up…"), reply exactly "SEARCH | <what to find>" instead of a note: a background web-search agent will look it up and its report will appear in your next turn under "Reports from your web-search agent". The room sees nothing while it runs, so deliver the answer as a note on a later turn using the report. Only search when explicitly asked to.
 
-People in the room can write their own margin notes on the page (shown to you as "Reader margin notes" with ids like m2). To respond to one, reply "REPLY m2 | <your response, at most 40 words>" — this opens an endnote thread attached to their note. Respond when you can add something real (an answer, a correction, a sharpened version of their point); stay silent otherwise. Readers can also open threads on YOUR notes; a parallel copy of you carries those conversations, and recent thread messages appear in your context — never use REPLY on a thread that already has messages.
+People in the room can write their own margin notes on the page (shown to you as "Reader margin notes" with ids like m2). To respond to one, reply "REPLY m2 | <your response, at most 40 words>" — this opens a side-conversation ("aside") attached to their note. Respond when you can add something real (an answer, a correction, a sharpened version of their point); stay silent otherwise. Readers can also open asides on YOUR notes; a parallel copy of you carries those conversations, and recent thread messages appear in your context — never use REPLY on a thread that already has messages.
 
 You may also reply "ASK | <question, at most 15 words>": it is projected to the room as a question from you, and someone may answer aloud (the answer reaches you through the transcript). Use your judgement about when — the best questions are high-entropy: you are genuinely uncertain of the answer, and the answer would change what you write next. A garbled key term, an ambiguous referent, suspected mis-attribution, a fork in the argument you can't resolve — all fair game. Don't ask what context already determines.
 
@@ -807,7 +807,7 @@ def build_user_content() -> list[dict]:
         for t in threads[-5:]:
             msgs = "; ".join(f"{m['who']}: {m['text'][:100]}" for m in t["messages"][-4:])
             tt.append(f"#{t['id']} (on {t['root_kind']} {t['root_id']}): {msgs}")
-        threads_block = ("Open endnote threads (a parallel you answers these — "
+        threads_block = ("Open asides (a parallel you answers these — "
                         "context only):\n" + "\n".join(tt) + "\n\n")
     # margin backpressure: when notes come faster than the margin can absorb
     # them, say so — the PASS bar rises at the source instead of the display
@@ -909,7 +909,7 @@ def thread_agent_thread(args, tid: int):
         msgs = "\n".join(f"{m['who']}: {m['text']}" for m in t["messages"])
         content = build_user_content()
         content.append({"type": "text", "text": (
-            f"\n[Endnote thread #{t['id']}] You are continuing a side "
+            f"\n[Aside #{t["id"]}] You are continuing a side "
             f"conversation attached to {thread_root_desc(t)}\n"
             f"The thread so far:\n{msgs}\n\n"
             "Reply with only your next message in this thread: conversational "
@@ -1098,7 +1098,7 @@ def commentator_thread(args):
             if mid < len(margins) and text:
                 t = open_thread("margin", mid)
                 thread_post(t, "marginalia", text)
-                print(f"[claude] replied to margin m{mid} (endnote #{t['id']})")
+                print(f"[claude] replied to margin m{mid} (aside #{t["id"]})")
             continue
         if reply.strip().upper().startswith("PASS"):
             reason = reply.split("|", 1)[1].strip() if "|" in reply else ""
