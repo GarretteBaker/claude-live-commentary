@@ -125,16 +125,27 @@ def mic_pcm_blocks(block_sec: float, sources: list[str] | None = None):
                               stdout=subprocess.PIPE)
              for s in (sources or [None])]
     n = int(BYTES_PER_SEC * block_sec)
+    frame_n = SAMPLE_RATE * ENERGY_FRAME_MS // 1000
     while True:
         bufs = [p.stdout.read(n) for p in procs]
         if any(not b for b in bufs):
             return
+        if sources:
+            # per-channel energy timeline, 50 ms frames, for mic-per-person
+            # speaker attribution
+            m = min(len(b) for b in bufs)
+            chans = [np.frombuffer(b[:m], np.int16).astype(np.float32)
+                     for b in bufs]
+            with energy_lock:
+                for f in range(0, m // 2, frame_n):
+                    energy_frames.append(np.array(
+                        [float(np.sqrt(np.mean(c[f:f + frame_n] ** 2)))
+                         for c in chans]))
         if len(bufs) == 1:
             yield bufs[0]
             continue
-        m = min(len(b) for b in bufs)
-        mix = np.sum([np.frombuffer(b[:m], np.int16).astype(np.int32)
-                      for b in bufs], axis=0)
+        mix = np.sum([c.astype(np.int32) for c in
+                      (np.frombuffer(b[:m], np.int16) for b in bufs)], axis=0)
         yield np.clip(mix, -32768, 32767).astype(np.int16).tobytes()
 
 
@@ -292,6 +303,27 @@ transcript = Transcript()
 audio_store = bytearray()
 audio_lock = threading.Lock()
 audio_meta = {"wall0": None, "speed": 1.0}  # wall0 = wall time of sample 0
+
+# mic-per-person mode: each capture channel belongs to one person, so speaker
+# attribution is hardware truth — argmax of per-channel energy over the word's
+# time span (your mic hears you louder than anyone else's mic does)
+ENERGY_FRAME_MS = 50
+energy_frames: list[np.ndarray] = []   # one per-channel RMS vector per frame
+energy_lock = threading.Lock()
+mic_map = {"names": []}                # non-empty => hardware attribution on
+
+
+def channel_for_span(a_ms: float, b_ms: float, floor: float) -> int | None:
+    f0 = int(a_ms // ENERGY_FRAME_MS)
+    f1 = max(f0 + 1, int(b_ms // ENERGY_FRAME_MS))
+    with energy_lock:
+        window = energy_frames[f0:f1]
+    if not window:
+        return None
+    e = np.mean(window, axis=0)
+    if float(e.max()) < floor:
+        return None
+    return int(e.argmax())
 
 
 def ts_for_ms(ms: float) -> str:
@@ -541,22 +573,26 @@ def assemblyai_transcriber_thread(audio_q: queue.Queue, args):
             emit(f"[silence {round(gap_ms / 1000)}s]",
                  (last_end_ms, words[0]["start"]))
         last_end_ms = words[-1]["end"]
-        # group consecutive words by speaker into lines (a turn is usually one
-        # speaker, but word-level attribution catches quick interjections)
-        lines: list[list] = []  # [spk, tokens, start_ms, end_ms]
-        for w in words:
+        # per-word speaker: hardware truth when each mic is one person, else
+        # AssemblyAI's voice diarization. lowercase = provisional (the
+        # revision lane rewrites these lines); PENDING/quiet = neutral
+        def who_of(w) -> str:
+            if mic_map["names"]:
+                ch = channel_for_span(w["start"], w["end"], args.gate_rms)
+                return mic_map["names"][ch].lower() if ch is not None else "speaker"
             spk = w.get("speaker")
-            if lines and lines[-1][0] == spk:
+            return ("speaker" if spk in (None, "UNKNOWN", "PENDING")
+                    else spk.lower())
+
+        lines: list[list] = []  # [who, tokens, start_ms, end_ms]
+        for w in words:
+            who = who_of(w)
+            if lines and lines[-1][0] == who:
                 lines[-1][1].append(w["text"])
                 lines[-1][3] = w["end"]
             else:
-                lines.append([spk, [w["text"]], w["start"], w["end"]])
-        for spk, tokens, a_ms, b_ms in lines:
-            # lowercase = provisional live attribution (the revision lane
-            # rewrites these with settled UPPERCASE letters); PENDING =
-            # diarization hasn't settled — stay neutral
-            who = ("speaker" if spk in (None, "UNKNOWN", "PENDING")
-                   else spk.lower())
+                lines.append([who, [w["text"]], w["start"], w["end"]])
+        for who, tokens, a_ms, b_ms in lines:
             emit(f"{who}: {' '.join(tokens)}", (a_ms, b_ms))
 
 
@@ -610,7 +646,8 @@ def scribe_revision_thread(args):
     if args.keyterms:
         terms = [t.strip() for t in Path(args.keyterms).read_text().splitlines()
                  if t.strip() and not t.startswith("#")][:1000]
-    stitcher = SpeakerStitcher()
+    # mic-per-person mode needs no voice stitching — attribution is hardware
+    stitcher = SpeakerStitcher() if not mic_map["names"] else None
     transcript.revision_active = True
     print(f"[scribe] revision lane on: scribe_v2 every {args.revise_sec:.0f}s"
           + (f", {len(terms)} keyterms" if terms else ""))
@@ -660,29 +697,40 @@ def scribe_revision_thread(args):
             revised_until = t1
             continue
 
-        # per-speaker voice samples for identity stitching (≤8 s each)
-        voice: dict[str, list[bytes]] = {}
-        for w in words:
-            if w["type"] != "word" or not w.get("speaker_id"):
-                continue
-            clips = voice.setdefault(w["speaker_id"], [])
-            if sum(len(c) for c in clips) < SAMPLE_RATE * 2 * 8:
-                clips.append(pcm_slice(t0 + w["start"] * 1000, t0 + w["end"] * 1000))
-        letters = {
-            spk: stitcher.letter(
-                np.frombuffer(b"".join(clips), np.int16).astype(np.float32) / 32768)
-            for spk, clips in voice.items()}
+        if mic_map["names"]:
+            # hardware attribution: whoever's mic was loudest owns the words
+            # (including audio events — the laugher's mic hears it loudest)
+            def settled_who(w) -> str:
+                ch = channel_for_span(t0 + w["start"] * 1000,
+                                      t0 + w["end"] * 1000, args.gate_rms)
+                return mic_map["names"][ch].upper() if ch is not None else "SPEAKER"
+        else:
+            # per-speaker voice samples for identity stitching (≤8 s each)
+            voice: dict[str, list[bytes]] = {}
+            for w in words:
+                if w["type"] != "word" or not w.get("speaker_id"):
+                    continue
+                clips = voice.setdefault(w["speaker_id"], [])
+                if sum(len(c) for c in clips) < SAMPLE_RATE * 2 * 8:
+                    clips.append(pcm_slice(t0 + w["start"] * 1000,
+                                           t0 + w["end"] * 1000))
+            letters = {
+                spk: stitcher.letter(
+                    np.frombuffer(b"".join(clips), np.int16).astype(np.float32) / 32768)
+                for spk, clips in voice.items()}
+
+            def settled_who(w) -> str:
+                return letters.get(w.get("speaker_id"), "SPEAKER")
 
         # group words into lines on speaker change or a long gap
         lines: list[tuple[str, tuple[float, float]]] = []
-        cur_spk, cur_tokens, cur_a, cur_b = None, [], None, None
+        cur_who, cur_tokens, cur_a, cur_b = None, [], None, None
         prev_end = None
 
         def flush():
             nonlocal cur_tokens
             if cur_tokens:
-                who = letters.get(cur_spk, "SPEAKER")
-                lines.append((f"[{ts_for_ms(t0 + cur_a * 1000)}] {who}: "
+                lines.append((f"[{ts_for_ms(t0 + cur_a * 1000)}] {cur_who}: "
                               f"{' '.join(cur_tokens)}",
                               (t0 + cur_a * 1000, t0 + cur_b * 1000)))
             cur_tokens = []
@@ -694,14 +742,15 @@ def scribe_revision_thread(args):
                 lines.append((f"[{ts_for_ms(t0 + w['start'] * 1000)}] "
                               f"[silence {round(gap)}s]",
                               (t0 + prev_end * 1000, t0 + w["start"] * 1000)))
-                cur_spk = None
+                cur_who = None
             token = w["text"]
             if w["type"] == "audio_event":
                 token = "[" + w["text"].strip("()") + "]"
-            if cur_tokens and w.get("speaker_id", cur_spk) != cur_spk:
+            who = settled_who(w)
+            if cur_tokens and who != cur_who:
                 flush()
             if not cur_tokens:
-                cur_spk, cur_a = w.get("speaker_id"), w["start"]
+                cur_who, cur_a = who, w["start"]
             cur_tokens.append(token)
             cur_b = w["end"]
             prev_end = w["end"]
@@ -785,6 +834,14 @@ def build_user_content() -> list[dict]:
 
 def build_system_prompt() -> str:
     system = COMMENTATOR_SYSTEM + CHATTINESS_ADDENDA[config["chattiness"]]
+    if mic_map["names"]:
+        system += (
+            "\n\nThis session uses one microphone per person, so speaker labels "
+            "are hardware-attributed and reliable — and unlike the default "
+            "described above, the lowercase and UPPERCASE forms of a label are "
+            "the SAME person (lowercase only means the text has not been revised "
+            "yet). Speakers in mic order: " + ", ".join(mic_map["names"]) + ". "
+            "A label of 'speaker'/'SPEAKER' means no mic clearly owned the words.")
     if config["context"]:
         system += ("\n\nBackground provided by the operator (abstract, "
                    "curriculum, notes) — use it to sharpen comments, never "
@@ -1193,6 +1250,14 @@ def main():
                         "several (e.g. two USB interfaces) into one mono feed. "
                         "Default: the system default source. List sources with: "
                         "pactl list sources short")
+    p.add_argument("--mic-names", metavar="NAME,NAME,...",
+                   help="one name per --mic source, in order: each mic belongs to "
+                        "that person and speaker attribution becomes hardware "
+                        "truth (loudest mic owns the words). Defaults to letters "
+                        "when several mics are captured")
+    p.add_argument("--gate-rms", type=float, default=150.0,
+                   help="per-channel RMS below which a word's timespan counts as "
+                        "silence for mic attribution")
     p.add_argument("--mock", action="store_true", help="canned comments instead of the Claude API")
     p.add_argument("--asr", default="auto",
                    choices=["auto", "whisper", "deepgram", "assemblyai"],
@@ -1279,9 +1344,18 @@ def main():
                     if "alsa_input.usb-" in l] or None
         if args.mic:
             print(f"[app] mics:     auto-detected {len(args.mic)} USB mic inputs")
+    if args.mic and not args.wav and (args.mic_names or len(args.mic) >= 2):
+        # each mic = one person: hardware speaker attribution
+        names = ([n.strip() for n in args.mic_names.split(",")]
+                 if args.mic_names else
+                 [chr(65 + i) for i in range(len(args.mic))])
+        if len(names) != len(args.mic):
+            sys.exit(f"--mic-names has {len(names)} names for {len(args.mic)} mics")
+        mic_map["names"] = names
     if args.mic:
-        for m in args.mic:
-            print(f"[app]   mic:    {m}")
+        for i, m in enumerate(args.mic):
+            owner = f" -> {mic_map['names'][i]}" if mic_map["names"] else ""
+            print(f"[app]   mic:    {m}{owner}")
     print(f"[app] asr:      {asr_desc}")
     print(f"[app] revise:   " + (f"scribe_v2 every {args.revise_sec:.0f}s "
                                  "(settled UPPERCASE letters, [laughter] tags)"

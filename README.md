@@ -119,7 +119,10 @@ terminal; while a Claude call is in flight the corner shows *thinking…*.
 | `--chattiness` | `strict` | `strict` / `chatty` / `eager`; retunable live from `/?ops` (`--chatty` = `chatty`) |
 | `--context` | — | text file (abstract, curriculum, notes) given to the commentator as background (and to AssemblyAI as a recognition prompt) |
 | `--keyterms` | — | file of names/terms (one per line) boosted in AssemblyAI recognition |
-| `--asr` | `auto` | `deepgram` (streaming diarization; needs `DEEPGRAM_API_KEY`) or local `whisper` |
+| `--mic` | auto | PipeWire source; repeat to mix several. Default: all USB interface inputs, else system default |
+| `--mic-names` | — | one name per mic, in order: each mic belongs to that person → **hardware speaker attribution** (loudest mic per word owns it); ≥2 mics default to letters |
+| `--gate-rms` | 150 | channel silence floor for mic attribution |
+| `--asr` | `auto` | `assemblyai` (streaming diarization) > `deepgram` > local `whisper` by available keys |
 | `--whisper-model` | `distil-large-v3` | `small.en` is lighter; both fly on the GPU (~0.2–0.5 s / 7 s chunk, ≤2 GB VRAM) |
 | `--device` | `auto` | cuda when available (nvidia pip wheels; app re-execs once to set `LD_LIBRARY_PATH`) |
 | `--chunk-sec` | 7 | transcription chunk length (latency vs. context) |
