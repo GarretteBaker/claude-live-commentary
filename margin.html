@@ -99,11 +99,8 @@
   /* a question to the room: red pencil, leading ? */
   .note.ask { color: #a03d2e; }
   .note.ask::before { content: "?  "; font-weight: 700; }
-  /* reader marginalia: pencil hand, distinct from Marginalia's ink */
-  .note.reader {
-    color: #6b6458; font-family: "Caveat", cursive; font-style: normal;
-    font-size: calc(clamp(20px, 1.7vw, 27px) * 1);
-  }
+  /* reader marginalia: same hand as Marginalia, graphite and smaller */
+  .note.reader { color: #6b6458; }
   /* endnote thread affordances */
   .note .threadmark {
     cursor: pointer; color: #a03d2e; font-weight: 700;
@@ -153,8 +150,9 @@
   #en-msgs .m.marginalia { color: var(--note-ink);
     font-family: var(--note-font, "KaTeX_Main"), Georgia, serif;
     font-style: var(--note-style, italic); font-size: 1.2rem; }
-  #en-msgs .m.reader { color: #6b6458; font-family: "Caveat", cursive;
-    font-size: 1.25rem; }
+  #en-msgs .m.reader { color: #6b6458;
+    font-family: var(--note-font, "KaTeX_Main"), Georgia, serif;
+    font-style: var(--note-style, italic); font-size: 1.05rem; }
   #endnote > input { background: none; border: none; border-top: 1px solid #d8cdb4;
     color: #4a4336; font: 0.9rem system-ui, sans-serif; padding: 0.6em 0.2em 0.2em; }
   #endnote > input::placeholder { color: #b8ad97; }
@@ -439,7 +437,8 @@
     for (const n of noteRegistry) {
       if (!n.el.classList.contains("scribble")) {
         const over = Math.max(0, y - n.y);
-        const s = Math.max(0.68, 1 - over / 1600);
+        const reader = n.el.classList.contains("reader") ? 0.82 : 1;
+        const s = Math.max(0.68, 1 - over / 1600) * reader;
         n.el.style.fontSize =
           `calc(clamp(22px, 2.0vw, 32px) * var(--note-scale, 1) * ${s.toFixed(3)})`;
       }
