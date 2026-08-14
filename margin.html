@@ -99,6 +99,65 @@
   /* a question to the room: red pencil, leading ? */
   .note.ask { color: #a03d2e; }
   .note.ask::before { content: "?  "; font-weight: 700; }
+  /* reader marginalia: pencil hand, distinct from Marginalia's ink */
+  .note.reader {
+    color: #6b6458; font-family: "Caveat", cursive; font-style: normal;
+    font-size: calc(clamp(20px, 1.7vw, 27px) * 1);
+  }
+  /* endnote thread affordances */
+  .note .threadmark {
+    cursor: pointer; color: #a03d2e; font-weight: 700;
+    vertical-align: super; font-size: 70%; margin-left: 0.15em;
+  }
+  .note .replybtn {
+    opacity: 0; cursor: pointer; border: none; background: none;
+    color: var(--pencil); font: 0.9rem system-ui, sans-serif; margin-left: 0.4em;
+    transition: opacity 0.2s;
+  }
+  .note:hover .replybtn { opacity: 0.8; }
+  .replyinput {
+    display: block; background: none; border: none;
+    border-bottom: 1px solid #d8cdb4; color: #4a4336;
+    font: 0.85rem system-ui, sans-serif; width: 92%; padding: 0.15em 0.2em;
+  }
+  .replyinput::placeholder { color: #b8ad97; }
+  /* floating annotate control over a text selection */
+  #annotate {
+    position: absolute; z-index: 5; display: none;
+    background: var(--paper); border: 1px solid #d8cdb4; border-radius: 8px;
+    padding: 0.3em 0.7em; box-shadow: 0 2px 12px rgba(60,50,30,0.15);
+    font: 0.85rem system-ui, sans-serif; color: #6b6458;
+  }
+  #annotate button { background: none; border: none; cursor: pointer;
+    color: #6b6458; font: inherit; }
+  #annotate input { background: none; border: none; border-bottom: 1px solid #d8cdb4;
+    color: #4a4336; font: inherit; width: 260px; padding: 0.1em 0.2em; }
+  /* the endnote panel: a side conversation, one per marked note */
+  #endnote {
+    position: fixed; top: 0; right: -440px; bottom: 0; width: 410px; z-index: 6;
+    background: var(--paper); border-left: 1px solid #d8cdb4;
+    box-shadow: -6px 0 22px rgba(60,50,30,0.13); transition: right 0.3s ease;
+    display: flex; flex-direction: column; padding: 1.1rem 1.3rem;
+  }
+  #endnote.open { right: 0; }
+  #endnote h3 { font: 600 0.8rem system-ui, sans-serif; color: var(--pencil);
+    letter-spacing: 0.12em; text-transform: uppercase; margin-bottom: 0.5rem; }
+  #endnote .close { position: absolute; top: 0.8rem; right: 1rem; cursor: pointer;
+    border: none; background: none; color: var(--pencil); font-size: 1rem; }
+  #en-root { font: italic 0.85rem Georgia, serif; color: #8a8172;
+    border-bottom: 1px solid #e8dfcc; padding-bottom: 0.55rem; margin-bottom: 0.7rem; }
+  #en-msgs { flex: 1; overflow-y: auto; }
+  #en-msgs .m { margin-bottom: 0.75rem; line-height: 1.25; }
+  #en-msgs .m .mwho { display: block; font: 0.6rem system-ui, sans-serif;
+    color: #b8ad97; letter-spacing: 0.08em; text-transform: uppercase; }
+  #en-msgs .m.marginalia { color: var(--note-ink);
+    font-family: var(--note-font, "KaTeX_Main"), Georgia, serif;
+    font-style: var(--note-style, italic); font-size: 1.2rem; }
+  #en-msgs .m.reader { color: #6b6458; font-family: "Caveat", cursive;
+    font-size: 1.25rem; }
+  #endnote > input { background: none; border: none; border-top: 1px solid #d8cdb4;
+    color: #4a4336; font: 0.9rem system-ui, sans-serif; padding: 0.6em 0.2em 0.2em; }
+  #endnote > input::placeholder { color: #b8ad97; }
   /* while Marginalia thinks: a hovering pencil at the freshest line */
   #pencil {
     position: absolute; left: 64%; padding-left: 0.9rem;
@@ -161,6 +220,14 @@
     <div id="pencil">✎</div>
   </div>
   <button id="texttoggle" title="also: press t">¶ text</button>
+  <div id="annotate"></div>
+  <div id="endnote">
+    <button class="close">✕</button>
+    <h3 id="en-title">Endnote</h3>
+    <div id="en-root"></div>
+    <div id="en-msgs"></div>
+    <input id="en-input" placeholder="reply… (Enter to send)">
+  </div>
   <div id="qr" hidden><img src="/qr.svg" alt=""><span id="qr-url"></span></div>
 <script>
   const params  = new URLSearchParams(location.search);
@@ -359,6 +426,7 @@
     writeWords(note, splitComment(comment.text).body, true, false);
     katexify(note.bodyEl);
     if (gradeOn && comment.id != null) note.el.append(gradeButtons(comment.id, comment));
+    if (comment.id != null) registerNote(note, "note", comment.id);
     layout();
   }
 
@@ -439,6 +507,129 @@
     return span;
   }
 
+  // ---- reader marginalia, endnote threads ----
+  const noteByKey = {};   // "note:3" / "margin:0" -> note object
+  const threadsC = {};    // tid -> {root_kind, root_id, msgs: []}
+  let openTid = null;
+  const SUP = "⁰¹²³⁴⁵⁶⁷⁸⁹";
+  const sup = (n) => String(n).split("").map(d => SUP[+d]).join("");
+
+  function registerNote(note, kind, id) {
+    note.rootKind = kind; note.rootId = id;
+    noteByKey[kind + ":" + id] = note;
+    const b = document.createElement("button");
+    b.className = "replybtn"; b.textContent = "↩"; b.title = "reply (opens an endnote)";
+    b.addEventListener("click", () => {
+      if (note.el.querySelector(".replyinput")) return;
+      const input = document.createElement("input");
+      input.className = "replyinput";
+      input.placeholder = "reply… (Enter to send)";
+      input.addEventListener("keydown", (k) => {
+        if (k.key === "Escape") { input.remove(); return; }
+        if (k.key !== "Enter" || !input.value.trim()) return;
+        fetch("/reply", { method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ root_kind: kind, root_id: id,
+                                 text: input.value.trim() }) })
+          .then(r => r.json()).then(r => { if (r.tid) openEndnote(r.tid); });
+        input.remove();
+        layout();
+      });
+      note.el.append(input);
+      input.focus();
+      layout();
+    });
+    note.el.append(b);
+  }
+
+  function setThreadmark(tid) {
+    const t = threadsC[tid];
+    const note = noteByKey[t.root_kind + ":" + t.root_id];
+    if (!note || note.el.querySelector(".threadmark")) return;
+    const mark = document.createElement("span");
+    mark.className = "threadmark"; mark.textContent = sup(tid);
+    mark.title = "open endnote " + tid;
+    mark.addEventListener("click", () => openEndnote(tid));
+    note.el.append(mark);
+  }
+
+  function openEndnote(tid) {
+    if (!threadsC[tid]) threadsC[tid] = { root_kind: null, root_id: null, msgs: [] };
+    openTid = tid;
+    const t = threadsC[tid];
+    document.getElementById("en-title").textContent = "Endnote " + sup(tid);
+    const root = noteByKey[t.root_kind + ":" + t.root_id];
+    document.getElementById("en-root").textContent = !root ? "" :
+      [...root.bodyEl.querySelectorAll(".w")].map(w => w.textContent).join(" ")
+        .slice(0, 160);
+    renderEndnoteMsgs();
+    document.getElementById("endnote").classList.add("open");
+    document.getElementById("en-input").focus();
+  }
+
+  function renderEndnoteMsgs() {
+    const box = document.getElementById("en-msgs");
+    box.innerHTML = "";
+    for (const m of (threadsC[openTid]?.msgs || [])) {
+      const d = document.createElement("div");
+      d.className = "m " + m.who;
+      const w = document.createElement("span");
+      w.className = "mwho"; w.textContent = m.who + " · " + m.ts;
+      d.append(w, document.createTextNode(m.text));
+      katexify(d);
+      box.append(d);
+    }
+    box.scrollTop = box.scrollHeight;
+  }
+
+  document.querySelector("#endnote .close").addEventListener("click", () => {
+    document.getElementById("endnote").classList.remove("open");
+    openTid = null;
+  });
+  document.getElementById("en-input").addEventListener("keydown", (k) => {
+    const input = k.target;
+    if (k.key !== "Enter" || !input.value.trim() || openTid === null) return;
+    const t = threadsC[openTid];
+    fetch("/reply", { method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ root_kind: t.root_kind, root_id: t.root_id,
+                             text: input.value.trim() }) });
+    input.value = "";
+  });
+
+  // ---- highlight body text -> write your own margin note ----
+  const annotate = document.getElementById("annotate");
+  document.addEventListener("mouseup", (e) => {
+    if (annotate.contains(e.target)) return;
+    const sel = window.getSelection();
+    const txt = sel.isCollapsed ? "" : sel.toString().trim();
+    if (!txt || !textEl.contains(sel.anchorNode)) { annotate.style.display = "none"; return; }
+    const rect = sel.getRangeAt(0).getBoundingClientRect();
+    annotate.innerHTML = "";
+    const b = document.createElement("button");
+    b.textContent = "✎ margin note";
+    const quote = txt.slice(0, 280);
+    b.addEventListener("click", () => {
+      annotate.innerHTML = "";
+      const input = document.createElement("input");
+      input.placeholder = "your note… (Enter)";
+      input.addEventListener("keydown", (k) => {
+        if (k.key === "Escape") { annotate.style.display = "none"; return; }
+        if (k.key !== "Enter" || !input.value.trim()) return;
+        fetch("/margin", { method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ quote, text: input.value.trim() }) });
+        annotate.style.display = "none";
+      });
+      annotate.append(input);
+      input.focus();
+    });
+    annotate.append(b);
+    annotate.style.left = Math.min(rect.left + window.scrollX, window.innerWidth - 320) + "px";
+    annotate.style.top = (rect.bottom + window.scrollY + 6) + "px";
+    annotate.style.display = "block";
+  });
+
   // ---- events ----
   const es = new EventSource("/events");
   es.onopen  = () => setStatus("live");
@@ -481,7 +672,24 @@
       writeWords(note, body, false, false);
       katexify(note.bodyEl);
       if (gradeOn) note.el.append(gradeButtons(ev.id, ev));
+      registerNote(note, "note", ev.id);
       layout();
+    } else if (ev.type === "user_margin") {          // a reader wrote on the page
+      const note = makeNote(null, "reader");
+      anchorNote(note, ev.quote);
+      writeWords(note, ev.text, true, false);
+      registerNote(note, "margin", ev.id);
+      layout();
+    } else if (ev.type === "thread") {
+      threadsC[ev.tid] = threadsC[ev.tid] ||
+        { root_kind: ev.root_kind, root_id: ev.root_id, msgs: [] };
+      threadsC[ev.tid].root_kind = ev.root_kind;
+      threadsC[ev.tid].root_id = ev.root_id;
+      setThreadmark(ev.tid);
+    } else if (ev.type === "thread_msg") {
+      if (!threadsC[ev.tid]) threadsC[ev.tid] = { root_kind: null, root_id: null, msgs: [] };
+      threadsC[ev.tid].msgs.push(ev);
+      if (openTid === ev.tid) renderEndnoteMsgs();
     } else if (ev.type === "comment_start") {
       pencil.classList.remove("on");
       liveNote = makeNote(ev.id);

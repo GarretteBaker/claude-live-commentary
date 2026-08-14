@@ -67,6 +67,8 @@ The room can vote on your notes; previous notes may carry tallies like [2↑ 1�
 
 You always see the full session transcript. If the room explicitly asks you to search or look something up ("Marginalia, search for…", "chat, look up…"), reply exactly "SEARCH | <what to find>" instead of a note: a background web-search agent will look it up and its report will appear in your next turn under "Reports from your web-search agent". The room sees nothing while it runs, so deliver the answer as a note on a later turn using the report. Only search when explicitly asked to.
 
+People in the room can write their own margin notes on the page (shown to you as "Reader margin notes" with ids like m2). To respond to one, reply "REPLY m2 | <your response, at most 40 words>" — this opens an endnote thread attached to their note. Respond when you can add something real (an answer, a correction, a sharpened version of their point); stay silent otherwise. Readers can also open threads on YOUR notes; a parallel copy of you carries those conversations, and recent thread messages appear in your context — never use REPLY on a thread that already has messages.
+
 You may also reply "ASK | <question, at most 15 words>": it is projected to the room as a question from you, and someone may answer aloud (the answer reaches you through the transcript). Use your judgement about when — the best questions are high-entropy: you are genuinely uncertain of the answer, and the answer would change what you write next. A garbled key term, an ambiguous referent, suspected mis-attribution, a fork in the argument you can't resolve — all fair game. Don't ask what context already determines.
 
 Most turns should be PASS. When you decline, reply "PASS | <ten-word reason>" so the operator can tune the system; the reason is never projected. Otherwise output only the note text (with its quote line) — no preamble or markdown. LaTeX math with $...$ or $$...$$ delimiters renders on the page; use it for formulas."""
@@ -331,6 +333,9 @@ broadcaster = Broadcaster()
 session_log = SessionLog()
 search_reports: list[dict] = []  # results from spawned search agents
 comments: list[dict] = []  # {"id", "text", "ts", "context"}
+margins: list[dict] = []   # reader-written margin notes {"id","quote","text","ts"}
+threads: list[dict] = []   # endnote threads {"id","root_kind","root_id","messages"}
+thread_agent_lock = threading.Lock()  # one thread-agent call at a time
 # handshake for pulling the partially-filled audio chunk through whisper
 # right before a Claude call, so the prompt includes the freshest words
 flush_req = threading.Event()
@@ -789,6 +794,21 @@ def build_user_content() -> list[dict]:
         return line
 
     prev = "\n".join(fmt(c) for c in comments[-10:]) or "(none)"
+    reader_block = ""
+    if margins:
+        mm = "\n".join(
+            f"- m{m['id']} on \"{m['quote'][:80]}\": {m['text']}"
+            + (f"  (already in thread #{m['thread']})" if m.get("thread") is not None else "")
+            for m in margins[-12:])
+        reader_block = f"Reader margin notes (written by people in the room):\n{mm}\n\n"
+    threads_block = ""
+    if threads:
+        tt = []
+        for t in threads[-5:]:
+            msgs = "; ".join(f"{m['who']}: {m['text'][:100]}" for m in t["messages"][-4:])
+            tt.append(f"#{t['id']} (on {t['root_kind']} {t['root_id']}): {msgs}")
+        threads_block = ("Open endnote threads (a parallel you answers these — "
+                        "context only):\n" + "\n".join(tt) + "\n\n")
     # margin backpressure: when notes come faster than the margin can absorb
     # them, say so — the PASS bar rises at the source instead of the display
     # drowning in ink
@@ -822,8 +842,10 @@ def build_user_content() -> list[dict]:
                             + ("\n".join(tail_lines) if tail_lines else "(nothing yet)")
                             + "\n")})
     blocks.append({"type": "text",
-                   "text": (f"\nYour previous comments:\n{prev}\n\n{reports_block}{pressure}"
-                            f"Reply with PASS, SEARCH | <query>, ASK | <question>, or one note.")})
+                   "text": (f"\nYour previous comments:\n{prev}\n\n{reader_block}"
+                            f"{threads_block}{reports_block}{pressure}"
+                            f"Reply with PASS, SEARCH | <query>, ASK | <question>, "
+                            f"REPLY m<id> | <response>, or one note.")})
     return blocks
 
 
@@ -844,6 +866,65 @@ def build_system_prompt() -> str:
                    "curriculum, notes) — use it to sharpen comments, never "
                    "comment on it directly:\n" + config["context"])
     return system
+
+
+# ------------------------------------------------------------- endnote threads
+
+def open_thread(root_kind: str, root_id: int) -> dict:
+    """Find or create the endnote thread attached to a note or reader margin."""
+    for t in threads:
+        if t["root_kind"] == root_kind and t["root_id"] == root_id:
+            return t
+    t = {"id": len(threads) + 1, "root_kind": root_kind, "root_id": root_id,
+         "messages": []}
+    threads.append(t)
+    (margins if root_kind == "margin" else comments)[root_id]["thread"] = t["id"]
+    broadcaster.publish({"type": "thread", "tid": t["id"],
+                         "root_kind": root_kind, "root_id": root_id})
+    session_log.log("thread", tid=t["id"], root_kind=root_kind, root_id=root_id)
+    return t
+
+
+def thread_post(t: dict, who: str, text: str):
+    msg = {"who": who, "text": text, "ts": time.strftime("%H:%M:%S")}
+    t["messages"].append(msg)
+    broadcaster.publish({"type": "thread_msg", "tid": t["id"], **msg})
+    session_log.log("thread_msg", tid=t["id"], who=who, text=text)
+
+
+def thread_root_desc(t: dict) -> str:
+    if t["root_kind"] == "margin":
+        m = margins[t["root_id"]]
+        return f"the reader's margin note on \"{m['quote'][:80]}\": {m['text']}"
+    return f"your note: {comments[t['root_id']]['text']}"
+
+
+def thread_agent_thread(args, tid: int):
+    """A parallel Marginalia carries the endnote conversation: same system
+    prompt, same full-transcript context (cache-shared with the main loop),
+    plus the thread so far. Serialized so replies to one thread stay ordered."""
+    import anthropic
+    t = threads[tid - 1]
+    with thread_agent_lock:
+        msgs = "\n".join(f"{m['who']}: {m['text']}" for m in t["messages"])
+        content = build_user_content()
+        content.append({"type": "text", "text": (
+            f"\n[Endnote thread #{t['id']}] You are continuing a side "
+            f"conversation attached to {thread_root_desc(t)}\n"
+            f"The thread so far:\n{msgs}\n\n"
+            "Reply with only your next message in this thread: conversational "
+            "margin voice, at most 60 words, no quote line, never PASS. "
+            "LaTeX renders.")})
+        client = anthropic.Anthropic(max_retries=4)
+        resp = client.beta.messages.create(
+            model=args.claude_model, max_tokens=500,
+            betas=["server-side-fallback-2026-07-01"], fallbacks="default",
+            output_config={"effort": args.effort},
+            system=build_system_prompt(),
+            messages=[{"role": "user", "content": content}])
+        text = "".join(b.text for b in resp.content if b.type == "text").strip()
+    thread_post(t, "marginalia", text)
+    print(f"[thread #{tid}] marginalia: {text}")
 
 
 SEARCH_AGENT_SYSTEM = """\
@@ -916,6 +997,7 @@ def stream_claude(client, args, comment_id: int) -> tuple[str, float | None]:
             # these stream to the screen (ASK lands whole via comment_done)
             if (len(clean) < 7 or clean[:4].upper() == "PASS"
                     or clean[:6].upper() == "SEARCH"
+                    or clean[:5].upper() == "REPLY"
                     or clean[:5].upper() == "ASK |" or clean[:4].upper() == "ASK|"):
                 continue
             if first is None:
@@ -1008,6 +1090,15 @@ def commentator_thread(args):
                                  "ts": time.strftime("%H:%M:%S")})
             threading.Thread(target=lambda: search_agent_thread(client, args, query),
                              name="search-agent", daemon=True).start()
+            continue
+        m_reply = re.match(r"REPLY\s+m?(\d+)\s*\|\s*(.*)", reply.strip(),
+                           re.IGNORECASE | re.DOTALL)
+        if m_reply:
+            mid, text = int(m_reply.group(1)), m_reply.group(2).strip()
+            if mid < len(margins) and text:
+                t = open_thread("margin", mid)
+                thread_post(t, "marginalia", text)
+                print(f"[claude] replied to margin m{mid} (endnote #{t['id']})")
             continue
         if reply.strip().upper().startswith("PASS"):
             reason = reply.split("|", 1)[1].strip() if "|" in reply else ""
@@ -1207,6 +1298,40 @@ def make_app(args) -> FastAPI:
             print(f"[grade] #{c['id']} note: {note}")
         return {"ok": True}
 
+    @app.post("/margin")
+    async def add_margin(body: dict):
+        """A reader highlighted page text and wrote their own margin note."""
+        m = {"id": len(margins), "quote": body.get("quote", "").strip()[:300],
+             "text": body.get("text", "").strip()[:500],
+             "ts": time.strftime("%H:%M:%S"), "thread": None}
+        if not m["text"]:
+            return {"ok": False}
+        margins.append(m)
+        broadcaster.publish({"type": "user_margin", **m})
+        session_log.log("user_margin", id=m["id"], quote=m["quote"], text=m["text"])
+        print(f"[margin] m{m['id']} on {m['quote'][:50]!r}: {m['text']}")
+        return {"ok": True, "id": m["id"]}
+
+    @app.post("/reply")
+    async def reply_endpoint(body: dict):
+        """A reader message into (or opening) an endnote thread; a parallel
+        Marginalia answers without blocking the main loop."""
+        kind, rid = body.get("root_kind"), int(body.get("root_id", -1))
+        text = body.get("text", "").strip()[:500]
+        pool = margins if kind == "margin" else comments
+        if not text or kind not in ("note", "margin") or not 0 <= rid < len(pool):
+            return {"ok": False}
+        t = open_thread(kind, rid)
+        thread_post(t, "reader", text)
+        print(f"[thread #{t['id']}] reader: {text}")
+        if args.mock:
+            thread_post(t, "marginalia",
+                        "(mock) Say more — which sense do you mean?")
+        else:
+            threading.Thread(target=lambda: thread_agent_thread(args, t["id"]),
+                             name=f"thread-agent-{t['id']}", daemon=True).start()
+        return {"ok": True, "tid": t["id"]}
+
     @app.get("/events")
     async def events():
         async def gen():
@@ -1224,6 +1349,18 @@ def make_app(args) -> FastAPI:
                                          "text": c["text"], "ts": c["ts"],
                                          "kind": c.get("kind", "note"),
                                          "up": c["up"], "down": c["down"]}))
+            for m in margins[-10:]:
+                replay.append((m["ts"], {"type": "user_margin", **m}))
+            for t in threads:
+                if not t["messages"]:
+                    continue
+                t0 = t["messages"][0]["ts"]
+                replay.append((t0, {"type": "thread", "tid": t["id"],
+                                    "root_kind": t["root_kind"],
+                                    "root_id": t["root_id"]}))
+                for msg in t["messages"][-8:]:
+                    replay.append((msg["ts"], {"type": "thread_msg",
+                                               "tid": t["id"], **msg}))
             for _ts, ev in sorted(replay, key=lambda p: p[0]):
                 yield f"data: {json.dumps(ev)}\n\n"
             while True:
