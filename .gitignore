@@ -3,3 +3,5 @@ __pycache__/
 *.log
 nohup.out
 sessions/
+sessions/archive.db
+sessions/*.wav

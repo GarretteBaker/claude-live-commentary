@@ -1079,6 +1079,16 @@ def build_system_prompt() -> str:
             "Speech from anyone without a mic is attributed to whichever mic "
             "heard it loudest — read attributions of clearly-different voices "
             "with that in mind.")
+    if config.get("recall") != "off":
+        system += (
+            "\n\nYou also have an archive of every previous session recorded in "
+            "this room (lectures, demos, casual conversation — transcripts, your "
+            "own past notes, past agent reports). Reply \"RECALL | <what to find>\" "
+            "to dispatch an archive agent that searches it; the report appears in "
+            "your next turn among the agent reports. It is fast (a few seconds) — "
+            "use it on your own judgement whenever an earlier session plausibly "
+            "bears on the discussion: a prior lecture on the same topic, an "
+            "earlier version of an argument, something this room decided before.")
     if config["context"]:
         system += ("\n\nBackground provided by the operator (abstract, "
                    "curriculum, notes) — use it to sharpen comments, never "
@@ -1294,6 +1304,171 @@ def muse_agent_thread(args, request: str):
     print(f"[muse-agent] done ({dt}s): {report[:160]}")
 
 
+# ------------------------------------------------------- session archive
+
+ARCHIVE_DB = Path(__file__).parent / "sessions" / "archive.db"
+_recall_state = {"block": ""}
+
+
+def build_archive(exclude: Path | None = None) -> tuple[int, int]:
+    """Ingest sessions/*.jsonl into a single FTS5 table — the "throw these all
+    into a shared database and have Claude run searches with the native tools"
+    idea from the 2026-08-16 session. Incremental by file mtime; the current
+    session's file is excluded (its content is already in the prompt)."""
+    import sqlite3
+    con = sqlite3.connect(ARCHIVE_DB)
+    con.executescript("""
+        CREATE VIRTUAL TABLE IF NOT EXISTS archive USING fts5(
+            text, session UNINDEXED, t UNINDEXED, kind UNINDEXED);
+        CREATE TABLE IF NOT EXISTS files(path TEXT PRIMARY KEY, mtime REAL);
+    """)
+    n_files = n_rows = 0
+    for p in sorted(ARCHIVE_DB.parent.glob("*.jsonl")):
+        if exclude and p.resolve() == exclude.resolve():
+            continue
+        mtime = p.stat().st_mtime
+        row = con.execute("SELECT mtime FROM files WHERE path=?", (p.name,)).fetchone()
+        if row and row[0] == mtime:
+            continue
+        con.execute("DELETE FROM archive WHERE session=?", (p.name,))
+        rows: list[tuple[str, str, str, str]] = []
+        for raw in p.read_text().splitlines():
+            if not raw.strip():
+                continue
+            e = json.loads(raw)
+            t, ty = e.get("t", ""), e["type"]
+            if ty == "transcript":
+                rows.append((e["text"], p.name, t, "speech"))
+            elif ty == "revision":
+                rows += [(l, p.name, t, "speech_settled") for l in e.get("lines", [])]
+            elif ty == "comment":
+                rows.append((e["text"], p.name, t, "note"))
+            elif ty == "search":
+                rows.append((f"Q: {e['query']} → {e['report']}", p.name, t, "search_report"))
+            elif ty == "muse_agent":
+                rows.append((f"Q: {e['request']} → {e['report']}", p.name, t, "muse_report"))
+            elif ty == "thread_msg":
+                rows.append((f"{e['who']}: {e['text']}", p.name, t, "thread"))
+            elif ty == "user_margin":
+                rows.append((e.get("text", ""), p.name, t, "reader_note"))
+        con.executemany("INSERT INTO archive(text, session, t, kind) VALUES(?,?,?,?)", rows)
+        con.execute("INSERT OR REPLACE INTO files(path, mtime) VALUES(?,?)", (p.name, mtime))
+        n_files += 1
+        n_rows += len(rows)
+    con.commit()
+    con.close()
+    return n_files, n_rows
+
+
+RECALL_AGENT_SYSTEM = """\
+You are the archive-recall agent for Marginalia, a live-lecture commentary system. archive.db is an SQLite database holding every previous session recorded in this room (lectures, demos, watercooler conversation). One FTS5 table:
+  archive(text, session UNINDEXED, t UNINDEXED, kind UNINDEXED)
+- text: one transcript line, margin note, or agent report
+- session: source file named YYYYMMDD-HHMMSS.jsonl, so sessions sort chronologically
+- t: ISO timestamp of the line
+- kind: speech (provisional ASR), speech_settled (higher-accuracy revision of the same audio — prefer it, but older sessions have only speech), note (the commentator's own margin notes), reader_note, thread, search_report, muse_report
+Query with execute_sql (read-only). FTS5 syntax: SELECT text, session, t FROM archive WHERE archive MATCH 'sparse AND autoencoder' ORDER BY rank LIMIT 20. Cast a wide net first, then read around promising hits (WHERE session=? AND t BETWEEN ...). Transcripts contain ASR errors — try phonetic variants of names and terms.
+Your final message becomes a short report injected into the live commentator's context: at most 120 words, the findings with session dates. If nothing relevant exists, say so plainly. No preamble."""
+
+RECALL_TOOLS = [{
+    "name": "execute_sql",
+    "description": "Run one read-only SQL query against archive.db. Returns rows as JSON, truncated to 4000 chars.",
+    "input_schema": {"type": "object", "properties": {"sql": {"type": "string"}},
+                     "required": ["sql"]},
+}]
+
+
+def recall_agent_thread(args, query: str):
+    """RECALL | <query>: a tool-use agent running SQL over the session archive."""
+    import sqlite3
+    import anthropic
+    con = sqlite3.connect(f"file:{ARCHIVE_DB}?mode=ro", uri=True)
+    client = anthropic.Anthropic(max_retries=4)
+    msgs = [{"role": "user", "content":
+             f"Find in the archive: {query}\n\n"
+             f"Current discussion context:\n{transcript.text()[-1500:]}"}]
+    t0 = time.monotonic()
+    for _hop in range(8):
+        resp = client.beta.messages.create(
+            model=args.claude_model, max_tokens=1500,
+            betas=["server-side-fallback-2026-07-01"], fallbacks="default",
+            output_config={"effort": "low"},
+            system=RECALL_AGENT_SYSTEM, tools=RECALL_TOOLS, messages=msgs)
+        if resp.stop_reason != "tool_use":
+            break
+        msgs.append({"role": "assistant", "content": resp.content})
+        results = []
+        for block in resp.content:
+            if block.type == "tool_use":
+                print(f"[recall-agent] {json.dumps(block.input)[:140]}")
+                # model-written SQL: syntax errors are feedback for the agent,
+                # not crashes (same narrow-except carve-out as the muse agent's
+                # Discord refusals; the connection is read-only at the DB layer)
+                try:
+                    rows = con.execute(block.input["sql"]).fetchmany(60)
+                    content = json.dumps(rows, default=str)[:4000]
+                    is_err = False
+                except sqlite3.Error as e:
+                    content = f"SQL error: {e}"
+                    is_err = True
+                results.append({"type": "tool_result", "tool_use_id": block.id,
+                                "content": content, "is_error": is_err})
+        msgs.append({"role": "user", "content": results})
+    con.close()
+    report = " ".join(b.text for b in resp.content if b.type == "text").strip()
+    dt = round(time.monotonic() - t0, 1)
+    search_reports.append({"ts": time.strftime("%H:%M:%S"),
+                           "query": f"[archive] {query}", "report": report})
+    broadcaster.publish({"type": "search_done", "query": f"[archive] {query}",
+                         "ts": time.strftime("%H:%M:%S"), "dt": dt})
+    session_log.log("recall", query=query, report=report, dt=dt)
+    print(f"[recall-agent] done ({dt}s): {report[:160]}")
+
+
+def recall_block() -> str:
+    b = _recall_state["block"]
+    return ("Possibly relevant moments from previous sessions in this room "
+            "(automatic retrieval — often noise; use only when genuinely "
+            "relevant, and RECALL for the full context):\n" + b + "\n\n"
+            if b else "")
+
+
+def recall_auto_thread(args):
+    """--recall auto: a background thread that keeps a small block of
+    prior-session moments matched to the last couple of minutes of speech —
+    the "Claude has background threads identifying relevant transcripts by
+    default" idea from the 2026-08-16 session."""
+    import sqlite3
+    con = sqlite3.connect(f"file:{ARCHIVE_DB}?mode=ro", uri=True)
+    seen = 0
+    while True:
+        time.sleep(45.0)
+        words = transcript.text().split()
+        if len(words) - seen < 40:
+            continue
+        seen = len(words)
+        toks = sorted({re.sub(r"[^a-z0-9]", "", w.lower()) for w in words[-150:]})
+        toks = [w for w in toks if len(w) >= 5 and w not in _QUERY_STOPWORDS]
+        if not toks:
+            continue
+        q = " OR ".join(f'"{w}"' for w in toks[:30])
+        rows = con.execute(
+            "SELECT session, t, kind, text FROM archive WHERE archive MATCH ? "
+            "ORDER BY rank LIMIT 12", (q,)).fetchall()
+        picked, sessions_seen = [], set()
+        for session, t, kind, text in rows:
+            if session in sessions_seen:   # spread across distinct sessions
+                continue
+            sessions_seen.add(session)
+            picked.append(f"- {session[:13]} [{kind}] {text[:150]}")
+            if len(picked) == 3:
+                break
+        block = "\n".join(picked)
+        if block != _recall_state["block"]:
+            _recall_state["block"] = block
+            print(f"[recall-auto] context updated ({len(picked)} moments)")
+
+
 SEARCH_AGENT_SYSTEM = """\
 You are the web-search agent for a live-lecture commentary system. You get one \
 query from the live commentator plus a little discussion context. Search the \
@@ -1333,16 +1508,6 @@ def search_agent_thread(client, args, query: str):
     session_log.log("search", query=query, report=report, dt=round(dt, 1))
     broadcaster.publish({"type": "search_done", "query": query,
                          "ts": time.strftime("%H:%M:%S"), "dt": round(dt, 1)})
-
-
-def recall_block() -> str:
-    """Auto-retrieved prior-session context (--recall auto); empty otherwise."""
-    return ""
-
-
-def recall_agent_thread(args, query: str):
-    """Placeholder until the archive lane lands; RECALL is inert at --recall off."""
-    raise RuntimeError("archive recall not built")
 
 
 _QUERY_STOPWORDS = set("the a an of for to in on at and or is are was were what "
@@ -1630,6 +1795,8 @@ def make_app(args) -> FastAPI:
             targets["diarizer"] = lambda: assemblyai_diarizer_thread(diarize_q, args)
         if args.revise:
             targets["revisor"] = lambda: scribe_revision_thread(args)
+        if args.recall == "auto":
+            targets["recall"] = lambda: recall_auto_thread(args)
 
         def spawn(name: str):
             threading.Thread(target=targets[name], name=name, daemon=True).start()
@@ -1906,6 +2073,11 @@ def main():
                         "effective cadence during speech is bounded by API latency)")
     p.add_argument("--min-new-words", type=int, default=1,
                    help="skip the Claude call unless this many new words arrived")
+    p.add_argument("--recall", choices=["off", "ask", "auto"], default="off",
+                   help="archive of previous sessions (sessions/archive.db, FTS5): "
+                        "ask = Marginalia can dispatch RECALL | <query> agents over "
+                        "it; auto = additionally a background thread injects "
+                        "relevant prior-session moments into its context")
     p.add_argument("--save-audio", choices=["auto", "on", "off"], default="auto",
                    help="save the session's raw audio to sessions/<stem>.wav for "
                         "debugging (~115 MB/h). auto = on for live mics, off for "
@@ -1988,6 +2160,11 @@ def main():
     print(f"[app] log:      {session_log.path}")
     if args.save_audio:
         print(f"[app] audio:    {session_log.path.with_suffix('.wav')} (raw PCM archive)")
+    config["recall"] = args.recall
+    if args.recall != "off":
+        nf, nr = build_archive(exclude=session_log.path)
+        print(f"[app] archive:  {ARCHIVE_DB.name} refreshed "
+              f"(+{nf} sessions, +{nr} rows), recall={args.recall}")
     uvicorn.run(make_app(args), host="0.0.0.0", port=args.port, log_level="warning")
 
 
