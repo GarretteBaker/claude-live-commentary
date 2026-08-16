@@ -45,7 +45,7 @@ Reply PASS unless your note is all of:
 - still worth reading a few minutes from now — not a reaction that expires with the moment;
 - not a summary or paraphrase of what was said;
 - understandable on its own, without extra context;
-- at most 25 words, in a margin-note register: compact and pointed; fragments, "NB:", "cf.", "?!" are all at home;
+- at most 25 words, in a margin-note register: compact and pointed; fragments, "NB:", "cf.", "?!" are all at home; 25 is a hard ceiling and it does not creep upward as the session goes on — when in doubt cut words;
 - clearly different from your previous notes (shown to you).
 
 Useful interventions:
@@ -86,7 +86,7 @@ Eager mode: comment at nearly every opportunity — any claim, question, definit
 }
 
 # mutable at runtime: the operator page (/?ops) can retune chattiness live
-config = {"chattiness": "strict", "context": ""}
+config = {"chattiness": "strict", "context": "", "recall": "off"}
 
 
 # ---------------------------------------------------------------- gpu setup
@@ -358,6 +358,7 @@ def ts_for_ms(ms: float) -> str:
 broadcaster = Broadcaster()
 session_log = SessionLog()
 search_reports: list[dict] = []  # results from spawned search agents
+dispatches: list[dict] = []      # every spawned background agent, for dedup
 comments: list[dict] = []  # {"id", "text", "ts", "context"}
 margins: list[dict] = []   # reader-written margin notes {"id","quote","text","ts"}
 threads: list[dict] = []   # endnote threads {"id","root_kind","root_id","messages"}
@@ -998,6 +999,16 @@ def build_user_content() -> list[dict]:
         f"- [{r['ts']}] you asked \"{r['query']}\" → {r['report']}"
         for r in search_reports[-3:])
     reports_block = f"Reports from your web-search agent:\n{reports}\n\n" if reports else ""
+    now_m = time.monotonic()
+    inflight = [d for d in dispatches
+                if d["t_done"] is None and now_m - d["t0"] < 600]
+    inflight_block = ""
+    if inflight:
+        ii = "\n".join(f"- [{d['kind']}] {d['query']} (running {int(now_m - d['t0'])}s)"
+                       for d in inflight[-4:])
+        inflight_block = ("Agents already working for you — their reports arrive "
+                          "in a later turn; do NOT dispatch these again:\n"
+                          + ii + "\n\n")
     segs = transcript.tail(10**9)
     header = "Full session transcript (most recent speech last):\n"
     blocks: list[dict] = []
@@ -1018,9 +1029,11 @@ def build_user_content() -> list[dict]:
                             + "\n")})
     blocks.append({"type": "text",
                    "text": (f"\nYour previous comments:\n{prev}\n\n{reader_block}"
-                            f"{threads_block}{reports_block}{pressure}"
+                            f"{threads_block}{reports_block}{inflight_block}"
+                            f"{recall_block()}{pressure}"
                             f"Reply with PASS, SEARCH | <query>, MUSE | <request>, "
-                            f"ASK | <question>, REPLY m<id> | <response>, or one note.")})
+                            + ("RECALL | <query>, " if config.get("recall") != "off" else "")
+                            + f"ASK | <question>, REPLY m<id> | <response>, or one note.")})
     return blocks
 
 
@@ -1092,7 +1105,7 @@ def thread_agent_thread(args, tid: int):
             "LaTeX renders.")})
         client = anthropic.Anthropic(max_retries=4)
         resp = client.beta.messages.create(
-            model=args.claude_model, max_tokens=500,
+            model=args.claude_model, max_tokens=1500,
             betas=["server-side-fallback-2026-07-01"], fallbacks="default",
             output_config={"effort": args.effort},
             system=build_system_prompt(),
@@ -1292,6 +1305,55 @@ def search_agent_thread(client, args, query: str):
                          "ts": time.strftime("%H:%M:%S"), "dt": round(dt, 1)})
 
 
+def recall_block() -> str:
+    """Auto-retrieved prior-session context (--recall auto); empty otherwise."""
+    return ""
+
+
+def recall_agent_thread(args, query: str):
+    """Placeholder until the archive lane lands; RECALL is inert at --recall off."""
+    raise RuntimeError("archive recall not built")
+
+
+_QUERY_STOPWORDS = set("the a an of for to in on at and or is are was were what "
+                       "who how why when where about look up search find out".split())
+
+
+def _query_tokens(q: str) -> set[str]:
+    return {w for w in re.findall(r"[a-z0-9]+", q.lower())
+            if w not in _QUERY_STOPWORDS}
+
+
+def dispatch_agent(kind: str, query: str, target) -> bool:
+    """Spawn a background agent (web search, discord, archive recall) unless
+    an equivalent one is in flight or finished within the last 3 minutes.
+    The commentator fires every few seconds and sees the same room request in
+    the transcript each time, so without this one spoken "look up X" fans out
+    into a pile of near-duplicate agents (observed: 4x for one pyannote ask)."""
+    now = time.monotonic()
+    toks = _query_tokens(query)
+    for d in dispatches:
+        if d["kind"] != kind:
+            continue
+        if d["t_done"] is None and now - d["t0"] > 600:
+            continue   # agent died without reporting; don't block forever
+        if d["t_done"] is not None and now - d["t_done"] > 180:
+            continue
+        inter, union = len(toks & d["tokens"]), len(toks | d["tokens"]) or 1
+        if inter / union >= 0.5:
+            return False
+    entry = {"kind": kind, "query": query, "tokens": toks,
+             "t0": now, "t_done": None}
+    dispatches.append(entry)
+
+    def run():
+        target()
+        entry["t_done"] = time.monotonic()
+
+    threading.Thread(target=run, name=f"{kind}-agent", daemon=True).start()
+    return True
+
+
 def stream_claude(client, args, comment_id: int) -> tuple[str, float | None]:
     """Stream a reply, publishing deltas to the display as soon as it is
     clear the reply is a comment rather than a PASS.
@@ -1304,7 +1366,8 @@ def stream_claude(client, args, comment_id: int) -> tuple[str, float | None]:
         kwargs = {"speed": "fast"}  # it cuts time-to-first-words directly
     with client.beta.messages.stream(
         model=args.claude_model,
-        max_tokens=500,
+        max_tokens=1500,  # thinking tokens count toward this; 500 truncated
+                          # long direct-address answers mid-word
         betas=["server-side-fallback-2026-07-01"]
               + (["fast-mode-2026-02-01"] if args.fast else []),
         fallbacks="default",
@@ -1336,6 +1399,9 @@ def stream_claude(client, args, comment_id: int) -> tuple[str, float | None]:
         final = stream.get_final_message()
     if final.stop_reason == "refusal":
         return "PASS", first
+    if final.stop_reason == "max_tokens":
+        print("[claude] reply hit max_tokens — truncated", flush=True)
+        session_log.log("truncated", tail=text[-80:])
     return text.strip(), first
 
 
@@ -1410,20 +1476,40 @@ def commentator_thread(args):
         print(f"[claude] ({timing}) {reply}")
         if re.match(r"MUSE\s*\|", reply.strip(), re.IGNORECASE):
             request = reply.split("|", 1)[1].strip()
-            print(f"[claude] spawning discord agent: {request!r}")
-            broadcaster.publish({"type": "search_spawn",
-                                 "text": "[discord] " + request,
-                                 "ts": time.strftime("%H:%M:%S")})
-            threading.Thread(target=lambda: muse_agent_thread(args, request),
-                             name="muse-agent", daemon=True).start()
+            if dispatch_agent("discord", request,
+                              lambda: muse_agent_thread(args, request)):
+                print(f"[claude] spawning discord agent: {request!r}")
+                broadcaster.publish({"type": "search_spawn",
+                                     "text": "[discord] " + request,
+                                     "ts": time.strftime("%H:%M:%S")})
+            else:
+                print(f"[claude] duplicate discord dispatch suppressed: {request!r}")
+                session_log.log("dupe_dispatch", kind="discord", query=request)
+            continue
+        if reply.strip().upper().startswith("RECALL"):
+            query = reply.split("|", 1)[1].strip() if "|" in reply else reply.strip()[6:].strip()
+            if config.get("recall") == "off":
+                print(f"[claude] RECALL requested but --recall off: {query!r}")
+            elif dispatch_agent("archive", query,
+                                lambda: recall_agent_thread(args, query)):
+                print(f"[claude] spawning archive-recall agent: {query!r}")
+                broadcaster.publish({"type": "search_spawn",
+                                     "text": "[archive] " + query,
+                                     "ts": time.strftime("%H:%M:%S")})
+            else:
+                print(f"[claude] duplicate recall dispatch suppressed: {query!r}")
+                session_log.log("dupe_dispatch", kind="archive", query=query)
             continue
         if reply.strip().upper().startswith("SEARCH"):
             query = reply.split("|", 1)[1].strip() if "|" in reply else reply.strip()[6:].strip()
-            print(f"[claude] spawning search agent: {query!r}")
-            broadcaster.publish({"type": "search_spawn", "text": query,
-                                 "ts": time.strftime("%H:%M:%S")})
-            threading.Thread(target=lambda: search_agent_thread(client, args, query),
-                             name="search-agent", daemon=True).start()
+            if dispatch_agent("web", query,
+                              lambda: search_agent_thread(client, args, query)):
+                print(f"[claude] spawning search agent: {query!r}")
+                broadcaster.publish({"type": "search_spawn", "text": query,
+                                     "ts": time.strftime("%H:%M:%S")})
+            else:
+                print(f"[claude] duplicate search dispatch suppressed: {query!r}")
+                session_log.log("dupe_dispatch", kind="web", query=query)
             continue
         m_reply = re.match(r"REPLY\s+m?(\d+)\s*\|\s*(.*)", reply.strip(),
                            re.IGNORECASE | re.DOTALL)
