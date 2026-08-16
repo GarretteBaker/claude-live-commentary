@@ -284,6 +284,36 @@ class SessionLog:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
+class WavArchiver:
+    """Streams the session's raw 16 kHz mono PCM to sessions/<stem>.wav as it
+    arrives (~115 MB/h), patching the RIFF/data sizes on every write so the
+    file is a valid WAV at any moment — a crash loses at most the last block.
+    Debugging companion to the JSONL log: replay any session's audio with
+    --wav sessions/<stem>.wav."""
+
+    def __init__(self, path: Path):
+        import struct
+        self._struct = struct
+        self.path = path
+        self._f = open(path, "wb")
+        self._n = 0
+        self._f.write(self._header(0))
+
+    def _header(self, n: int) -> bytes:
+        s = self._struct
+        return (b"RIFF" + s.pack("<I", 36 + n) + b"WAVEfmt "
+                + s.pack("<IHHIIHH", 16, 1, 1, SAMPLE_RATE, BYTES_PER_SEC, 2, 16)
+                + b"data" + s.pack("<I", n))
+
+    def append(self, pcm: bytes):
+        self._f.seek(44 + self._n)
+        self._f.write(pcm)
+        self._n += len(pcm)
+        self._f.seek(0)
+        self._f.write(self._header(self._n))
+        self._f.flush()
+
+
 class Broadcaster:
     """Threads publish events; async SSE clients each get an asyncio.Queue."""
 
@@ -1570,12 +1600,17 @@ def make_app(args) -> FastAPI:
             queue.Queue() if args.asr == "scribe" and not mic_map["names"]
             and os.environ.get("ASSEMBLYAI_API_KEY") else None)
 
+        archiver = (WavArchiver(session_log.path.with_suffix(".wav"))
+                    if args.save_audio and session_log.path else None)
+
         def reader():
             for b in blocks:
                 if audio_meta["wall0"] is None:
                     audio_meta["wall0"] = time.time()
                 with audio_lock:
                     audio_store.extend(b)   # retained for the revision lane
+                if archiver:
+                    archiver.append(b)
                 audio_q.put(b)
                 if diarize_q is not None:
                     diarize_q.put(b)
@@ -1871,8 +1906,14 @@ def main():
                         "effective cadence during speech is bounded by API latency)")
     p.add_argument("--min-new-words", type=int, default=1,
                    help="skip the Claude call unless this many new words arrived")
+    p.add_argument("--save-audio", choices=["auto", "on", "off"], default="auto",
+                   help="save the session's raw audio to sessions/<stem>.wav for "
+                        "debugging (~115 MB/h). auto = on for live mics, off for "
+                        "--wav replays (the source file already exists)")
     p.add_argument("--port", type=int, default=8710)
     args = p.parse_args()
+    args.save_audio = (args.save_audio == "on"
+                       or (args.save_audio == "auto" and not args.wav))
 
     if args.asr == "auto":
         args.asr = ("scribe" if os.environ.get("ELEVENLABS_API_KEY")
@@ -1945,6 +1986,8 @@ def main():
                                  "(settled UPPERCASE letters, [laughter] tags)"
                                  if args.revise else "off (provisional ASR only)"))
     print(f"[app] log:      {session_log.path}")
+    if args.save_audio:
+        print(f"[app] audio:    {session_log.path.with_suffix('.wav')} (raw PCM archive)")
     uvicorn.run(make_app(args), host="0.0.0.0", port=args.port, log_level="warning")
 
 
