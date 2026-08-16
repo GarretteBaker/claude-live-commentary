@@ -761,7 +761,9 @@ def scribe_realtime_transcriber_thread(audio_q: queue.Queue, args):
             raise RuntimeError(f"scribe realtime: {msg}")
         if mt == "committed_transcript_with_timestamps":
             last_commit[0] = time.monotonic()
-            words = [w for w in msg.get("words", []) if w.get("type") == "word"]
+            # "words" can be present-but-null (e.g. a commit forced during
+            # silence), which dodges .get()'s default
+            words = [w for w in msg.get("words") or [] if w.get("type") == "word"]
             if words:
                 batches.put((time.monotonic() + delay, words))
 
