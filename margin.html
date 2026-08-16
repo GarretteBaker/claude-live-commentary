@@ -84,7 +84,7 @@
     display: block; font-size: 62%; font-weight: 500;
     color: var(--note-ink-soft); margin-bottom: 0.1em;
   }
-  .note .w { display: inline-block; opacity: 0; margin-right: 0.26em; }
+  .note .w { display: inline-block; opacity: 0; }
   .note .w.ink { animation: ink 0.30s ease-out forwards; }
   .note .w.now { opacity: 1; }             /* replayed notes: no re-drawing */
   @keyframes ink {
@@ -95,6 +95,15 @@
   .note .katex { font-size: 0.82em; }      /* KaTeX next to cursive runs large */
   .note.scribble {
     color: var(--pencil); font-weight: 500; font-size: clamp(17px, 1.4vw, 22px);
+  }
+  .note.scribble.done { opacity: 0.4; font-size: clamp(11px, 0.85vw, 14px); }
+  /* unreadably small notes (margin congestion / resolved scribbles) pop back
+     to full size on hover, expanding downward over whatever sits beneath */
+  .note.cramped:hover, .note.scribble.done:hover {
+    font-size: calc(clamp(22px, 2.0vw, 32px) * var(--note-scale, 1)) !important;
+    opacity: 1; z-index: 7; background: var(--paper);
+    box-shadow: 0 4px 16px rgba(60,50,30,0.18); border-radius: 4px;
+    padding: 0.25rem 0.5rem 0.35rem 0.9rem;
   }
   /* a question to the room: red pencil, leading ? */
   .note.ask { color: #a03d2e; }
@@ -463,7 +472,9 @@
       const w = document.createElement("span");
       w.className = "w " + (animate ? "ink" : "now");
       w.textContent = parts[note.rendered];
-      note.bodyEl.append(w);
+      // real space text nodes: inline-block spans swallow trailing spaces,
+      // and CSS margins don't survive copy-paste
+      note.bodyEl.append(w, document.createTextNode(" "));
       if (parts[note.rendered].includes("$")) katexify(w);
     }
   }
@@ -487,9 +498,10 @@
       if (!n.el.classList.contains("scribble")) {
         const over = Math.max(0, y - n.y);
         const reader = n.el.classList.contains("reader") ? 0.82 : 1;
-        const s = Math.max(0.68, 1 - over / 1600) * reader;
+        const shrink = Math.max(0.68, 1 - over / 1600);
         n.el.style.fontSize =
-          `calc(clamp(22px, 2.0vw, 32px) * var(--note-scale, 1) * ${s.toFixed(3)})`;
+          `calc(clamp(22px, 2.0vw, 32px) * var(--note-scale, 1) * ${(shrink * reader).toFixed(3)})`;
+        n.el.classList.toggle("cramped", shrink < 0.85);
       }
       y = Math.max(n.y, y) + n.el.offsetHeight + 14;
     }
@@ -559,6 +571,7 @@
 
   // ---- reader marginalia, endnote threads ----
   const noteByKey = {};   // "note:3" / "margin:0" -> note object
+  const scribblesByQuery = {};   // search scribbles, collapsed on completion
   const threadsC = {};    // tid -> {root_kind, root_id, msgs: []}
   let openTid = null;
   const SUP = "⁰¹²³⁴⁵⁶⁷⁸⁹";
@@ -834,7 +847,15 @@
       const note = makeNote(null, "scribble");
       note.y = anchorY(null);
       note.bodyEl.textContent = "🔎 looking up: " + ev.text;
+      scribblesByQuery[ev.text] = note;
       layout();
+    } else if (ev.type === "search_done") {
+      const note = scribblesByQuery[ev.query];   // resolved: collapse to a stub
+      if (note) {
+        note.el.classList.add("done");
+        note.bodyEl.textContent = "✓ " + ev.query;
+        layout();
+      }
     } else if (ev.type === "status") {
       setStatus(ev.text);
     } else if (ev.type === "grade") {
