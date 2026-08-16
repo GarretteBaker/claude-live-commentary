@@ -1526,18 +1526,20 @@ def make_app(args) -> FastAPI:
             q = broadcaster.subscribe()
             # replay the recent conversation for late joiners, interleaved in
             # time order; stored transcript lines are "[HH:MM:SS] text"
+            # replay the whole book: partial replay leaves reloaded notes
+            # with nothing to anchor to (they float)
             replay = []
-            for sid, seg in transcript.tail_with_ids(25):
+            for sid, seg in transcript.tail_with_ids(10**9):
                 ts, _, text = seg.partition("] ")
                 ts = ts.lstrip("[")
                 replay.append((ts, {"type": "transcript", "text": text,
                                     "ts": ts, "id": sid}))
-            for c in comments[-8:]:
+            for c in comments:
                 replay.append((c["ts"], {"type": "comment", "id": c["id"],
                                          "text": c["text"], "ts": c["ts"],
                                          "kind": c.get("kind", "note"),
                                          "up": c["up"], "down": c["down"]}))
-            for m in margins[-10:]:
+            for m in margins:
                 replay.append((m["ts"], {"type": "user_margin", **m}))
             for t in threads:
                 if not t["messages"]:

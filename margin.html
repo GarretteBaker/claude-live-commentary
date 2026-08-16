@@ -369,7 +369,25 @@
         if (ok) return words.slice(i, i + t.length).map(w => w.el);
       }
     }
-    return null;
+    // fuzzy fallback: the revision lane may have rewritten the quoted words
+    // (better ASR ≠ same words). Slide a window over the text and take the
+    // best bag-of-words overlap; later occurrences win ties.
+    if (seq.length < 3) return null;
+    const bag = new Set(seq);
+    let best = null, bestScore = 0.55;
+    for (const win of [seq.length, seq.length + 1, Math.max(3, seq.length - 1)]) {
+      let hits = 0;
+      for (let i = 0; i + win <= words.length; i++) {
+        if (i === 0) {
+          for (let j = 0; j < win; j++) hits += bag.has(words[j].n);
+        } else {
+          hits += bag.has(words[i + win - 1].n) - bag.has(words[i - 1].n);
+        }
+        const score = hits / Math.max(win, seq.length);
+        if (score >= bestScore) { bestScore = score; best = [i, win]; }
+      }
+    }
+    return best ? words.slice(best[0], best[0] + best[1]).map(w => w.el) : null;
   }
 
   // ---- margin notes ----
