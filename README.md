@@ -54,10 +54,18 @@ by word-timestamp overlap, with a `--fuse-delay` hold so labels arrive
 first), else **AssemblyAI Universal-3.5 Pro streaming** (integrated live
 diarization), else **Deepgram nova-3**, else **local faster-whisper** (~7 s
 GPU chunks, ECAPA clustering, private, no cloud). Force one with
-`--asr whisper|deepgram|assemblyai|scribe`. Cloud backends reconnect
-automatically on network blips. Scribe realtime keyterms are capped by the
-API at the file's first 50 terms of ≤20 chars (batch revision still gets up
-to 1000).
+`--asr whisper|deepgram|assemblyai|scribe|gpt-realtime`. Cloud backends
+reconnect automatically on network blips. Scribe realtime keyterms are capped
+by the API at the file's first 50 terms of ≤20 chars (batch revision still
+gets up to 1000). `--asr gpt-realtime` is an EXPERIMENTAL lane (OpenAI
+realtime transcription websocket, `--gpt-asr-model`, needs `OPENAI_API_KEY`);
+spans come from server VAD so revision and speaker fusion still align.
+
+`--diarizer pyannote` swaps the revision lane's speaker attribution from
+Scribe's cloud ids to **local pyannote community-1** (audio never leaves the
+machine; `uv add pyannote-audio`, one-time gated HuggingFace accept,
+`HF_TOKEN`). Shaky lines get confidence annotations like `B~62%:` and the
+commentator is prompted to reattribute them from conversational context.
 
 The AssemblyAI path also takes `--keyterms names.txt` (one name/term per
 line, ≤100 used) — **keyterm prompting targets exactly the tokens Claude
@@ -131,7 +139,10 @@ terminal; while a Claude call is in flight the corner shows *thinking…*.
 | `--no-speakers` | off | disable LECTURER/AUDIENCE labeling |
 | `--call-gap` | 1 | min seconds between Claude calls (calls never overlap) |
 | `--min-new-words` | 1 | skip the Claude call if less new speech than this |
-| `--claude-model` | `claude-opus-5` | |
+| `--claude-model` | `claude-opus-5` | commentator model; `kimi/<m>` → Moonshot (Anthropic-compatible), `openai/<m>` → OpenAI, or any endpoint via `--model-base-url`/`--model-key-env`. Background agents stay on Anthropic |
+| `--recall` | `off` | `ask` = Marginalia can dispatch `RECALL \| <query>` agents over the FTS archive of all past sessions (`sessions/archive.db`); `auto` = plus background retrieval of relevant prior-session moments into its context |
+| `--save-audio` | `auto` | raw session audio → `sessions/<stem>.wav` (valid WAV at every moment, ~115 MB/h); auto = on for mics, off for replays |
+| `--diarizer` | `auto` | `pyannote` = local diarization in the revision lane with `B~62%:` confidence annotations |
 | `--effort` | `medium` | Claude reasoning effort — `low` is a latency lever |
 | `--fast` | off | Opus fast mode: ~2.5× generation speed at 2× price (~2–4¢/call); cuts time-to-first-words without the quality cost of `--effort low` |
 
@@ -150,6 +161,20 @@ separate Claude call with the server-side `web_search` tool) and its report
 is injected into the next commentary turn. The feed notch shows
 `🔎 search agent · <query>` while it runs; the answer lands as a normal
 comment a turn later. It only searches when explicitly asked.
+
+## The session archive (`--recall`)
+
+Every past `sessions/*.jsonl` is ingested (incrementally, at startup) into
+`sessions/archive.db` — a single SQLite FTS5 table of transcript lines,
+settled revisions, Marginalia's notes, reader notes, and agent reports. With
+`--recall ask` the commentator can reply `RECALL | <what to find>`: a
+background agent runs read-only SQL over the archive and reports back in a
+few seconds. With `--recall auto` a background thread additionally matches
+the last couple of minutes of speech against the archive and keeps up to
+three prior-session moments in the commentator's context. All background
+dispatches (web, discord, archive) are deduplicated: an equivalent request
+in flight or completed in the last 3 minutes is suppressed, and in-flight
+agents are listed in the prompt so the model doesn't re-request them.
 
 ## Session logs
 
