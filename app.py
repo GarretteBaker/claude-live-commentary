@@ -838,6 +838,53 @@ class SpeakerStitcher:
         return chr(65 + len(self._centroids) - 1)
 
 
+def _pyannote_pipeline(device: str):
+    """Local speaker diarization: pyannote community-1 (CC-BY-4.0, runs fully
+    offline after a one-time gated HuggingFace download). Audio never leaves
+    the machine — this replaces Scribe's cloud speaker ids in the revision
+    lane when --diarizer pyannote."""
+    from pyannote.audio import Pipeline
+    import torch
+    tok = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
+    pipe = Pipeline.from_pretrained("pyannote/speaker-diarization-community-1",
+                                    token=tok)
+    pipe.to(torch.device("cuda" if device == "cuda" else "cpu"))
+    return pipe
+
+
+def _pyannote_turns(pipe, pcm: bytes) -> list[tuple[float, float, str]]:
+    """(start_s, end_s, local_label) turns for one revision window. Prefers the
+    exclusive output (non-overlapping partition, 'the speaker most likely to be
+    transcribed') — built exactly for word-timestamp assignment."""
+    import torch
+    wav = torch.from_numpy(
+        np.frombuffer(pcm, np.int16).astype(np.float32) / 32768)[None]
+    out = pipe({"waveform": wav, "sample_rate": SAMPLE_RATE})
+    ann = getattr(out, "exclusive_speaker_diarization", None)
+    if ann is None:
+        ann = getattr(out, "speaker_diarization", out)
+    return [(seg.start, seg.end, label)
+            for seg, _, label in ann.itertracks(yield_label=True)]
+
+
+def _pyannote_word_speaker(turns, a: float, b: float) -> tuple[str | None, float]:
+    """Max-overlap speaker for a word span, plus the fraction of the span the
+    winner covers — a cheap per-word attribution confidence. Words falling in
+    a diarization gap get the nearest turn at confidence 0."""
+    ov: dict[str, float] = {}
+    for s, e, l in turns:
+        o = min(b, e) - max(a, s)
+        if o > 0:
+            ov[l] = ov.get(l, 0.0) + o
+    if ov:
+        win = max(ov, key=ov.get)
+        return win, ov[win] / max(b - a, 1e-6)
+    if turns:
+        nearest = min(turns, key=lambda t: max(t[0] - b, a - t[1], 0.0))
+        return nearest[2], 0.0
+    return None, 0.0
+
+
 def scribe_revision_thread(args):
     """Every ~--revise-sec, re-transcribe the provisional audio tail with
     ElevenLabs Scribe v2 batch (top accuracy, full diarization, [laughter]
@@ -853,6 +900,11 @@ def scribe_revision_thread(args):
                  if t.strip() and not t.startswith("#")][:1000]
     # mic-per-person mode needs no voice stitching — attribution is hardware
     stitcher = SpeakerStitcher() if not mic_map["names"] else None
+    pyannote_pipe = (_pyannote_pipeline(args.device)
+                     if args.diarizer == "pyannote" and not mic_map["names"]
+                     else None)
+    if pyannote_pipe is not None:
+        print("[pyannote] local diarization on (community-1, revision lane)")
     transcript.revision_active = True
     print(f"[scribe] revision lane on: scribe_v2 every {args.revise_sec:.0f}s"
           + (f", {len(terms)} keyterms" if terms else ""))
@@ -907,9 +959,25 @@ def scribe_revision_thread(args):
         if mic_map["names"]:
             # hardware attribution: whoever's mic was loudest owns the words
             # (including audio events — the laugher's mic hears it loudest)
-            def settled_who(w) -> str:
+            def settled_who(w) -> tuple[str, float | None]:
                 ch = channel_for_span(t0 + w["start"] * 1000, t0 + w["end"] * 1000)
-                return mic_map["names"][ch].upper()
+                return mic_map["names"][ch].upper(), None
+        elif pyannote_pipe is not None:
+            turns = _pyannote_turns(pyannote_pipe, pcm_slice(t0, t1))
+            # voice clips per local pyannote label, for cross-window stitching
+            voice: dict[str, list[bytes]] = {}
+            for s, e, l in turns:
+                clips = voice.setdefault(l, [])
+                if sum(len(c) for c in clips) < SAMPLE_RATE * 2 * 8:
+                    clips.append(pcm_slice(t0 + s * 1000, t0 + e * 1000))
+            letters = {
+                l: stitcher.letter(
+                    np.frombuffer(b"".join(clips), np.int16).astype(np.float32) / 32768)
+                for l, clips in voice.items()}
+
+            def settled_who(w) -> tuple[str, float | None]:
+                l, conf = _pyannote_word_speaker(turns, w["start"], w["end"])
+                return letters.get(l, "SPEAKER"), conf
         else:
             # per-speaker voice samples for identity stitching (≤8 s each)
             voice: dict[str, list[bytes]] = {}
@@ -925,21 +993,28 @@ def scribe_revision_thread(args):
                     np.frombuffer(b"".join(clips), np.int16).astype(np.float32) / 32768)
                 for spk, clips in voice.items()}
 
-            def settled_who(w) -> str:
-                return letters.get(w.get("speaker_id"), "SPEAKER")
+            def settled_who(w) -> tuple[str, float | None]:
+                return letters.get(w.get("speaker_id"), "SPEAKER"), None
 
         # group words into lines on speaker change or a long gap
         lines: list[tuple[str, tuple[float, float]]] = []
         cur_who, cur_tokens, cur_a, cur_b = None, [], None, None
+        cur_confs: list[float] = []
         prev_end = None
 
         def flush():
-            nonlocal cur_tokens
+            nonlocal cur_tokens, cur_confs
             if cur_tokens:
-                lines.append((f"[{ts_for_ms(t0 + cur_a * 1000)}] {cur_who}: "
+                who = cur_who
+                # local-diarizer confidence: annotate shaky attributions so
+                # the commentator can reattribute from conversational context
+                # ("obviously the second — they're responding to the first")
+                if cur_confs and min(cur_confs) < 0.75:
+                    who = f"{cur_who}~{int(min(cur_confs) * 100)}%"
+                lines.append((f"[{ts_for_ms(t0 + cur_a * 1000)}] {who}: "
                               f"{' '.join(cur_tokens)}",
                               (t0 + cur_a * 1000, t0 + cur_b * 1000)))
-            cur_tokens = []
+            cur_tokens, cur_confs = [], []
 
         for w in words:
             gap = w["start"] - prev_end if prev_end is not None else 0
@@ -952,12 +1027,14 @@ def scribe_revision_thread(args):
             token = w["text"]
             if w["type"] == "audio_event":
                 token = "[" + w["text"].strip("()") + "]"
-            who = settled_who(w)
+            who, conf = settled_who(w)
             if cur_tokens and who != cur_who:
                 flush()
             if not cur_tokens:
                 cur_who, cur_a = who, w["start"]
             cur_tokens.append(token)
+            if conf is not None:
+                cur_confs.append(conf)
             cur_b = w["end"]
             prev_end = w["end"]
         flush()
@@ -1079,6 +1156,14 @@ def build_system_prompt() -> str:
             "Speech from anyone without a mic is attributed to whichever mic "
             "heard it loudest — read attributions of clearly-different voices "
             "with that in mind.")
+    if config.get("diarizer") == "pyannote":
+        system += (
+            "\n\nSettled speaker labels may carry an attribution confidence, "
+            "e.g. \"B~62%:\" — the local diarizer's share of acoustic evidence "
+            "for that line. Low percentages mean the attribution is shaky: "
+            "reattribute from conversational context (who is responding to "
+            "whom, whose thread of argument it continues) before building a "
+            "note on who said what.")
     if config.get("recall") != "off":
         system += (
             "\n\nYou also have an archive of every previous session recorded in "
@@ -2138,6 +2223,14 @@ def main():
                    help="batch revision lane: rewrite the provisional streaming tail with "
                         "ElevenLabs Scribe v2 (full diarization, [laughter] tags, top WER). "
                         "auto = on when ELEVENLABS_API_KEY is set and --asr is assemblyai")
+    p.add_argument("--diarizer", choices=["auto", "pyannote"], default="auto",
+                   help="speaker attribution in the revision lane (voice mode): "
+                        "auto = ElevenLabs Scribe batch speaker ids; pyannote = "
+                        "local pyannote community-1 (audio stays on this machine) "
+                        "with per-line confidence annotations like B~62%% that let "
+                        "the commentator reattribute from context. Needs "
+                        "`uv add pyannote-audio`, a one-time gated HuggingFace "
+                        "accept, and HF_TOKEN. Ignored in mic-per-person mode")
     p.add_argument("--revise-sec", type=float, default=30.0,
                    help="minimum seconds of provisional audio before a revision pass")
     p.add_argument("--call-gap", type=float, default=1.0,
@@ -2201,6 +2294,20 @@ def main():
     args.revise = (args.revise == "on"
                    or (args.revise == "auto" and args.asr in ("assemblyai", "scribe")
                        and bool(os.environ.get("ELEVENLABS_API_KEY"))))
+    if args.diarizer == "pyannote":
+        if not args.revise:
+            sys.exit("--diarizer pyannote runs in the revision lane; it needs "
+                     "--revise on (ELEVENLABS_API_KEY + --asr assemblyai|scribe)")
+        if importlib.util.find_spec("pyannote") is None:
+            sys.exit("--diarizer pyannote needs the pyannote.audio package:\n"
+                     "  uv add pyannote-audio\n"
+                     "then accept the gated model conditions once at\n"
+                     "  https://huggingface.co/pyannote/speaker-diarization-community-1\n"
+                     "and set HF_TOKEN in the environment")
+        if not (os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")):
+            sys.exit("--diarizer pyannote needs HF_TOKEN (a HuggingFace read "
+                     "token, after accepting the community-1 model conditions)")
+        config["diarizer"] = "pyannote"
     for backend, envvar in (("deepgram", "DEEPGRAM_API_KEY"),
                             ("assemblyai", "ASSEMBLYAI_API_KEY"),
                             ("scribe", "ELEVENLABS_API_KEY")):
