@@ -686,6 +686,108 @@ def assemblyai_diarizer_thread(audio_q: queue.Queue, args):
                     speaker_timeline.append((w["start"], w["end"], spk.lower()))
 
 
+def gpt_realtime_transcriber_thread(audio_q: queue.Queue, args):
+    """EXPERIMENTAL (from the 2026-08-16 session: "we can try GPT realtime as
+    well"): OpenAI's realtime transcription websocket as the fast lane. No
+    native diarization — speakers come from per-person mics, the AssemblyAI
+    timeline, or stay 'speaker'. Spans come from server VAD events, so the
+    revision lane still aligns. Protocol written from docs, untested live."""
+    import base64
+    import websocket
+
+    prompt = ""
+    if args.keyterms:
+        terms = [t.strip() for t in Path(args.keyterms).read_text().splitlines()
+                 if t.strip() and not t.startswith("#")][:50]
+        prompt = "Vocabulary: " + ", ".join(terms) + ". "
+    if config["context"]:
+        prompt += config["context"][:200]
+
+    ws = websocket.create_connection(
+        "wss://api.openai.com/v1/realtime?intent=transcription",
+        header=[f"Authorization: Bearer {os.environ['OPENAI_API_KEY']}",
+                "OpenAI-Beta: realtime=v1"])
+    ws.send(json.dumps({"type": "transcription_session.update", "session": {
+        "input_audio_format": "pcm16",   # 24 kHz mono s16le
+        "input_audio_transcription": {"model": args.gpt_asr_model,
+                                      "prompt": prompt.strip(),
+                                      "language": args.language},
+        "turn_detection": {"type": "server_vad", "silence_duration_ms": 500},
+    }}))
+    print(f"[gpt-realtime] connected: {args.gpt_asr_model} (experimental lane)")
+    broadcaster.publish({"type": "status", "text": "listening"})
+
+    def upsample(b: bytes) -> bytes:
+        # feed is 16 kHz; the realtime pcm16 format is 24 kHz
+        x = np.frombuffer(b, np.int16).astype(np.float32)
+        m = int(len(x) * 1.5)
+        y = np.interp(np.arange(m) * (len(x) - 1) / max(m - 1, 1),
+                      np.arange(len(x)), x)
+        return y.astype(np.int16).tobytes()
+
+    def sender():
+        while True:
+            ws.send(json.dumps({"type": "input_audio_buffer.append",
+                                "audio": base64.b64encode(
+                                    upsample(audio_q.get())).decode()}))
+
+    threading.Thread(target=sender, name="gpt-rt-sender", daemon=True).start()
+
+    def emit(line: str, span: tuple[float, float] | None):
+        sid = transcript.append(f"[{time.strftime('%H:%M:%S')}] {line}", span)
+        print(f"[asr] {line}")
+        broadcaster.publish({"type": "transcript", "text": line, "id": sid,
+                             "ts": time.strftime("%H:%M:%S")})
+        session_log.log("transcript", text=line)
+
+    pending: list[dict] = []   # VAD segments awaiting their transcript
+    seen_types: set[str] = set()
+    last_end_ms = None
+    while True:
+        raw = ws.recv()
+        if not raw:
+            raise ConnectionError("gpt-realtime websocket closed")
+        msg = json.loads(raw)
+        mt = msg.get("type", "")
+        if mt not in seen_types:
+            seen_types.add(mt)
+            print(f"[gpt-realtime] first {mt}: {json.dumps(msg)[:200]}")
+        if mt == "error" or mt.endswith(".failed"):
+            raise RuntimeError(f"gpt-realtime error: {json.dumps(msg)[:400]}")
+        if mt == "input_audio_buffer.speech_started":
+            pending.append({"item_id": msg.get("item_id"),
+                            "a": msg.get("audio_start_ms"), "b": None})
+        elif mt == "input_audio_buffer.speech_stopped":
+            for seg in reversed(pending):
+                if seg["b"] is None:
+                    seg["b"] = msg.get("audio_end_ms")
+                    break
+        elif mt == "conversation.item.input_audio_transcription.completed":
+            text = (msg.get("transcript") or "").strip()
+            if not text:
+                continue
+            seg = next((s for s in pending
+                        if s["item_id"] == msg.get("item_id")), None)
+            if seg is None and pending:
+                seg = pending[0]
+            if seg is not None:
+                pending.remove(seg)
+            span = ((seg["a"], seg["b"]) if seg and seg["a"] is not None
+                    and seg["b"] is not None else None)
+            if span and last_end_ms is not None and span[0] - last_end_ms > 2500:
+                emit(f"[silence {round((span[0] - last_end_ms) / 1000)}s]",
+                     (last_end_ms, span[0]))
+            if span:
+                last_end_ms = span[1]
+            if mic_map["names"] and span:
+                who = mic_map["names"][channel_for_span(*span)].lower()
+            elif span:
+                who = (speaker_for_span(*span) or "speaker").lower()
+            else:
+                who = "speaker"
+            emit(f"{who}: {text}", span)
+
+
 def scribe_realtime_transcriber_thread(audio_q: queue.Queue, args):
     """Fast lane on ElevenLabs Scribe v2 Realtime (best streaming WER, no
     native diarization): word timestamps + either mic-channel attribution
@@ -1901,7 +2003,8 @@ def make_app(args) -> FastAPI:
         # scribe fast lane in voice mode runs AAI in parallel as a pure
         # speaker timeline — both need the audio, so tee it
         diarize_q: queue.Queue | None = (
-            queue.Queue() if args.asr == "scribe" and not mic_map["names"]
+            queue.Queue()
+            if args.asr in ("scribe", "gpt-realtime") and not mic_map["names"]
             and os.environ.get("ASSEMBLYAI_API_KEY") else None)
 
         archiver = (WavArchiver(session_log.path.with_suffix(".wav"))
@@ -1924,6 +2027,7 @@ def make_app(args) -> FastAPI:
         transcriber = {"deepgram": deepgram_transcriber_thread,
                        "assemblyai": assemblyai_transcriber_thread,
                        "scribe": scribe_realtime_transcriber_thread,
+                       "gpt-realtime": gpt_realtime_transcriber_thread,
                        }.get(args.asr, transcriber_thread)
         targets = {
             "audio": reader,
@@ -1964,7 +2068,7 @@ def make_app(args) -> FastAPI:
                 broadcaster.publish({"type": "status",
                                      "text": "commentator crashed — see terminal"})
             elif exc.thread.name in ("transcriber", "diarizer") and args.asr in (
-                    "deepgram", "assemblyai", "scribe") and (
+                    "deepgram", "assemblyai", "scribe", "gpt-realtime") and (
                     issubclass(exc.exc_type, (OSError, ConnectionError))
                     or "WebSocket" in exc.exc_type.__name__) \
                     and not audio_meta.get("ended"):
@@ -2173,12 +2277,17 @@ def main():
                         "when several mics are captured")
     p.add_argument("--mock", action="store_true", help="canned comments instead of the Claude API")
     p.add_argument("--asr", default="auto",
-                   choices=["auto", "whisper", "deepgram", "assemblyai", "scribe"],
+                   choices=["auto", "whisper", "deepgram", "assemblyai", "scribe",
+                            "gpt-realtime"],
                    help="auto = scribe realtime (ElevenLabs, best streaming WER; "
                         "diarization from per-person mics, or from a parallel "
                         "AssemblyAI speaker timeline in voice mode) when "
                         "ELEVENLABS_API_KEY is set, else assemblyai, else deepgram, "
                         "else local whisper")
+    p.add_argument("--gpt-asr-model", default="gpt-4o-transcribe",
+                   help="model for the EXPERIMENTAL --asr gpt-realtime lane "
+                        "(OpenAI realtime transcription websocket; override "
+                        "with a newer realtime model name to test it)")
     p.add_argument("--fuse-delay", type=float, default=2.5,
                    help="scribe voice mode: seconds to hold committed lines so the "
                         "AssemblyAI speaker timeline can label them")
@@ -2288,11 +2397,14 @@ def main():
     if not args.keyterms and default_keyterms.exists():
         args.keyterms = str(default_keyterms)
     if args.revise == "on" and not (os.environ.get("ELEVENLABS_API_KEY")
-                                    and args.asr in ("assemblyai", "scribe")):
-        sys.exit("--revise on needs ELEVENLABS_API_KEY and --asr assemblyai|scribe "
-                 "(revision aligns to the streaming lane's word timestamps)")
+                                    and args.asr in ("assemblyai", "scribe",
+                                                     "gpt-realtime")):
+        sys.exit("--revise on needs ELEVENLABS_API_KEY and --asr "
+                 "assemblyai|scribe|gpt-realtime (revision aligns to the "
+                 "streaming lane's timestamps)")
     args.revise = (args.revise == "on"
-                   or (args.revise == "auto" and args.asr in ("assemblyai", "scribe")
+                   or (args.revise == "auto"
+                       and args.asr in ("assemblyai", "scribe", "gpt-realtime")
                        and bool(os.environ.get("ELEVENLABS_API_KEY"))))
     if args.diarizer == "pyannote":
         if not args.revise:
@@ -2310,7 +2422,8 @@ def main():
         config["diarizer"] = "pyannote"
     for backend, envvar in (("deepgram", "DEEPGRAM_API_KEY"),
                             ("assemblyai", "ASSEMBLYAI_API_KEY"),
-                            ("scribe", "ELEVENLABS_API_KEY")):
+                            ("scribe", "ELEVENLABS_API_KEY"),
+                            ("gpt-realtime", "OPENAI_API_KEY")):
         if args.asr == backend and not os.environ.get(envvar):
             sys.exit(f"--asr {backend} needs {envvar} in the environment")
     ensure_cuda_libs()
@@ -2337,6 +2450,8 @@ def main():
     asr_desc = {"deepgram": "deepgram nova-3 (streaming diarization)",
                 "assemblyai": "assemblyai universal-3-5-pro (streaming diarization)",
                 "scribe": f"elevenlabs scribe realtime (diarization: {scribe_diar})",
+                "gpt-realtime": (f"openai {args.gpt_asr_model} EXPERIMENTAL "
+                                 f"(diarization: {scribe_diar})"),
                 }.get(args.asr, f"whisper {args.whisper_model} on {args.device}")
     if not args.mic and not args.wav:
         # zero-config hardware: capture every plugged-in audio-interface mic
