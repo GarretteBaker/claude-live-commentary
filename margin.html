@@ -306,15 +306,34 @@
   }
 
   const lineEvents = [];   // {id, text, ts} in render order, for revisions
+  let lastNoteTop = 0;     // top of the newest note, in #book coordinates
 
   function appendTranscript(ev) {
     lineEvents.push(ev);
     renderLine(ev);
   }
 
+  // when commentary runs ahead of speech, the text column yields: the next
+  // paragraph starts level with the newest note, so the two frontiers track
+  // each other. The spacer carries the following line's id, so revision
+  // tear-outs take it along.
+  function catchUpToNotes(lid) {
+    if (window.matchMedia("(max-width: 760px)").matches) return;
+    const textBottom = textEl.offsetTop + textEl.offsetHeight;
+    const gap = lastNoteTop - textBottom;
+    if (gap > 40) {
+      const sp = document.createElement("div");
+      sp.className = "gapspacer";
+      sp.dataset.line = lid;
+      sp.style.height = gap + "px";
+      textEl.append(sp);
+    }
+  }
+
   function renderLine(ev) {
     const lid = ev.id ?? -1;
     if (/^\[silence \d+s\]$/.test(ev.text)) {  // long pauses render as a gap mark
+      catchUpToNotes(lid);
       const p = document.createElement("p");
       p.className = "pausemark";
       p.dataset.line = lid;
@@ -329,6 +348,7 @@
     const prov = !!(who && /[a-z]/.test(who));   // lowercase = provisional
     const body = m ? m[2] : ev.text;
     if (!para || who !== paraWho || paraWords > 90) {
+      catchUpToNotes(lid);
       para = document.createElement("p");
       para.className = "para";
       if (who) {
@@ -502,6 +522,7 @@
       const top = Math.max(n.y, y);
       n.el.style.top = top + "px";
       y = top + n.el.offsetHeight + 14;
+      lastNoteTop = top;   // the commentary frontier the text catches up to
     }
     pencil.style.top = Math.max(anchorY(null), y) + "px";
     bookEl.style.minHeight = Math.max(textEl.offsetHeight, y) + 300 + "px";
