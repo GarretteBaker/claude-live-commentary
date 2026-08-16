@@ -1105,10 +1105,32 @@ def thread_agent_thread(args, tid: int):
 # ------------------------------------------------------------- muse agent
 
 MUSE_AGENT_SYSTEM = """\
-You are Marginalia's back-office agent for the Iliad Discord, handling one request from the seminar room.
+You are Muse, Iliad's embedded agent, here acting as Marginalia's back-office hand for one request from the seminar room. Your standing memory is appended below — the same files the interactive Muse loads.
 Tools: full-text search over the synced message archive (usually fresh enough — search FIRST; a full sync takes minutes, so sync at most a couple of specific channels), reading channels/threads, and posting — which the infrastructure only permits into the #claude channel (id {write_channel}).
+DMs are NOT in the search index: list_dm_channels gives the DM channel ids the bot has been messaged in; read one with read_messages, or sync_messages([id]) and then search.
 POST ONLY IF THE REQUEST EXPLICITLY ASKS FOR A POST. Looking things up never justifies posting.
+Confidentiality: your report is projected on a screen in a seminar room. Facts-level only — never relay DM contents, personal or hiring specifics, or confidential ops detail into a report; if the request requires exactly that, say so instead of complying.
 Your final message becomes a short report injected into the live commentator's context: at most 120 words, just the findings (or the exact content you posted and where). No preamble."""
+
+MUSE_MEMORY_FILES = ["muse-role.md", "project_iliad_org_state.md",
+                     "project_iliad_ops_people.md",
+                     "project_iliad_intensive_drive.md", "project_discord_mcp.md"]
+
+
+def _muse_memory() -> str:
+    mem_dir = Path.home() / ".claude/projects/-home-garrettbaker/memory"
+    parts = [p.read_text() for f in MUSE_MEMORY_FILES if (p := mem_dir / f).exists()]
+    return "\n\n---\n\n".join(parts)[:24000]
+
+
+def _list_dm_channels() -> list[dict]:
+    import sqlite3
+    con = sqlite3.connect(str(Path.home() / "discord-mcp" / "messages.db"))
+    rows = con.execute(
+        "SELECT channel_id, MAX(created_at), COUNT(*) FROM wake_queue "
+        "WHERE kind='dm' GROUP BY channel_id").fetchall()
+    con.close()
+    return [{"channel_id": r[0], "last_wake": r[1], "wakes": r[2]} for r in rows]
 
 DISCORD_TOOLS = [
     {"name": "sync_messages", "description": "Sync new Discord messages into the local search index. SLOW when unscoped (minutes across all channels) — search the existing index FIRST, and sync only specific channel_ids when you truly need messages from the last hours.",
@@ -1136,6 +1158,8 @@ DISCORD_TOOLS = [
          "channel_id": {"type": "string"}, "content": {"type": "string"},
          "reply_to_message_id": {"type": "string"}},
          "required": ["channel_id", "content"]}},
+    {"name": "list_dm_channels", "description": "DM channels the bot has received messages in (DMs are not in the search index — read them with read_messages, or sync_messages([id]) then search).",
+     "input_schema": {"type": "object", "properties": {}}},
 ]
 
 
@@ -1172,8 +1196,9 @@ def muse_agent_thread(args, request: str):
     import httpx
     ds = _discord_module()
     client = anthropic.Anthropic(max_retries=4)
-    system = MUSE_AGENT_SYSTEM.format(
+    system = (MUSE_AGENT_SYSTEM.format(
         write_channel=os.environ.get("WRITE_CHANNEL_IDS", "?"))
+        + "\n\n# Standing Muse memory\n\n" + _muse_memory())
     msgs = [{"role": "user", "content": f"Request from the seminar room: {request}"}]
     t0 = time.monotonic()
     for _hop in range(8):
@@ -1192,9 +1217,10 @@ def muse_agent_thread(args, request: str):
                 # Discord API refusals (403 no-access, 404 gone) are data the
                 # agent should react to, not crashes — the ONE sanctioned
                 # narrow except in this codebase; anything else still raises
+                fn = (_list_dm_channels if block.name == "list_dm_channels"
+                      else getattr(ds, block.name))
                 try:
-                    content = json.dumps(getattr(ds, block.name)(**block.input),
-                                         default=str)[:6000]
+                    content = json.dumps(fn(**block.input), default=str)[:6000]
                     is_err = False
                 except httpx.HTTPStatusError as e:
                     content = (f"{e.response.status_code} "
