@@ -1112,15 +1112,18 @@ POST ONLY IF THE REQUEST EXPLICITLY ASKS FOR A POST. Looking things up never jus
 Confidentiality: your report is projected on a screen in a seminar room. Facts-level only — never relay DM contents, personal or hiring specifics, or confidential ops detail into a report; if the request requires exactly that, say so instead of complying.
 Your final message becomes a short report injected into the live commentator's context: at most 120 words, just the findings (or the exact content you posted and where). No preamble."""
 
-MUSE_MEMORY_FILES = ["muse-role.md", "project_iliad_org_state.md",
-                     "project_iliad_ops_people.md",
-                     "project_iliad_intensive_drive.md", "project_discord_mcp.md"]
-
-
 def _muse_memory() -> str:
+    """Muse keeps living notes in the shared Claude memory directory (the
+    listener's wakes write there too) — load muse-role plus every project_*
+    note, so notes Muse writes later are picked up automatically. Denylist
+    for personal (non-org) files; the confidentiality rule in the prompt
+    guards the output side."""
     mem_dir = Path.home() / ".claude/projects/-home-garrettbaker/memory"
-    parts = [p.read_text() for f in MUSE_MEMORY_FILES if (p := mem_dir / f).exists()]
-    return "\n\n---\n\n".join(parts)[:24000]
+    deny = {"project_pcl5_tracking.md"}   # personal health tracking, not org context
+    files = [mem_dir / "muse-role.md"] + sorted(
+        p for p in mem_dir.glob("project_*.md") if p.name not in deny)
+    parts = [p.read_text() for p in files if p.exists()]
+    return "\n\n---\n\n".join(parts)[:30000]
 
 
 def _list_dm_channels() -> list[dict]:
