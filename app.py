@@ -1123,7 +1123,11 @@ def _muse_memory() -> str:
     files = [mem_dir / "muse-role.md"] + sorted(
         p for p in mem_dir.glob("project_*.md") if p.name not in deny)
     parts = [p.read_text() for p in files if p.exists()]
-    return "\n\n---\n\n".join(parts)[:30000]
+    text = "\n\n---\n\n".join(parts)
+    if len(text) > 120_000:   # backstop only; today's total is ~43k
+        print(f"[muse-agent] memory truncated: {len(text)} chars > 120k cap")
+        text = text[:120_000]
+    return text
 
 
 def _list_dm_channels() -> list[dict]:
@@ -1199,9 +1203,13 @@ def muse_agent_thread(args, request: str):
     import httpx
     ds = _discord_module()
     client = anthropic.Anthropic(max_retries=4)
-    system = (MUSE_AGENT_SYSTEM.format(
-        write_channel=os.environ.get("WRITE_CHANNEL_IDS", "?"))
-        + "\n\n# Standing Muse memory\n\n" + _muse_memory())
+    # cache breakpoint: the system prompt (incl. ~43k chars of memory) is
+    # identical across MUSE calls in a session — repeat calls read it at 0.1x
+    system = [{"type": "text",
+               "text": (MUSE_AGENT_SYSTEM.format(
+                   write_channel=os.environ.get("WRITE_CHANNEL_IDS", "?"))
+                   + "\n\n# Standing Muse memory\n\n" + _muse_memory()),
+               "cache_control": {"type": "ephemeral"}}]
     msgs = [{"role": "user", "content": f"Request from the seminar room: {request}"}]
     t0 = time.monotonic()
     for _hop in range(8):
