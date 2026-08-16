@@ -322,6 +322,23 @@ energy_lock = threading.Lock()
 mic_map = {"names": []}                # non-empty => hardware attribution on
 
 
+# voice-mode fusion: AssemblyAI runs as a pure speaker timeline ("who spoke
+# when"), and Scribe realtime's words get labels by timestamp overlap
+speaker_timeline: list[tuple[float, float, str]] = []   # (a_ms, b_ms, letter)
+timeline_lock = threading.Lock()
+
+
+def speaker_for_span(a_ms: float, b_ms: float) -> str | None:
+    best: dict[str, float] = {}
+    with timeline_lock:
+        recent = speaker_timeline[-500:]
+    for x, y, s in recent:
+        ov = min(b_ms, y) - max(a_ms, x)
+        if ov > 0:
+            best[s] = best.get(s, 0.0) + ov
+    return max(best, key=best.get) if best else None
+
+
 def channel_for_span(a_ms: float, b_ms: float) -> int:
     f0 = int(a_ms // ENERGY_FRAME_MS)
     f1 = max(f0 + 1, int(b_ms // ENERGY_FRAME_MS))
@@ -602,6 +619,151 @@ def assemblyai_transcriber_thread(audio_q: queue.Queue, args):
                 lines.append([who, [w["text"]], w["start"], w["end"]])
         for who, tokens, a_ms, b_ms in lines:
             emit(f"{who}: {' '.join(tokens)}", (a_ms, b_ms))
+
+
+def assemblyai_diarizer_thread(audio_q: queue.Queue, args):
+    """AssemblyAI reduced to a speaker timeline: same websocket, but instead of
+    emitting transcript lines it records (start_ms, end_ms, letter) intervals.
+    Scribe realtime's words then get speakers by timestamp overlap."""
+    import urllib.parse
+    import websocket
+
+    params = {"speech_model": "universal-3-5-pro", "encoding": "pcm_s16le",
+              "sample_rate": "16000", "speaker_labels": "true"}
+    ws = websocket.create_connection(
+        "wss://streaming.assemblyai.com/v3/ws?" + urllib.parse.urlencode(params),
+        header=[f"Authorization: {os.environ['ASSEMBLYAI_API_KEY']}"],
+    )
+    print("[diarizer] assemblyai speaker timeline connected")
+
+    def sender():
+        while True:
+            ws.send_binary(audio_q.get())
+
+    threading.Thread(target=sender, name="diarizer-sender", daemon=True).start()
+
+    while True:
+        msg = json.loads(ws.recv())
+        if msg.get("type") != "Turn" or not msg.get("end_of_turn"):
+            continue
+        with timeline_lock:
+            for w in msg.get("words", []):
+                spk = w.get("speaker")
+                if spk not in (None, "UNKNOWN", "PENDING"):
+                    speaker_timeline.append((w["start"], w["end"], spk.lower()))
+
+
+def scribe_realtime_transcriber_thread(audio_q: queue.Queue, args):
+    """Fast lane on ElevenLabs Scribe v2 Realtime (best streaming WER, no
+    native diarization): word timestamps + either mic-channel attribution
+    (per-person mics) or the AssemblyAI speaker timeline (voice mode, with a
+    short hold so the timeline is populated before lines publish)."""
+    import base64
+    import urllib.parse
+    import websocket
+
+    params = {"audio_format": "pcm_16000", "include_timestamps": "true",
+              "commit_strategy": "vad", "vad_silence_threshold_secs": "0.5",
+              "language_code": args.language}
+    if args.keyterms:
+        # realtime caps keyterms at 50 of ≤20 chars each (batch: 1000 of ≤50)
+        # and wants repeated query params, not a JSON array
+        terms = [t.strip() for t in Path(args.keyterms).read_text().splitlines()
+                 if t.strip() and not t.startswith("#") and len(t.strip()) <= 20][:50]
+        params["keyterms"] = terms
+        print(f"[scribe-rt] biasing {len(terms)} keyterms (≤20 chars each)")
+    ws = websocket.create_connection(
+        "wss://api.elevenlabs.io/v1/speech-to-text/realtime?"
+        + urllib.parse.urlencode(params, doseq=True),
+        header=[f"xi-api-key: {os.environ['ELEVENLABS_API_KEY']}"],
+    )
+    print("[scribe-rt] connected: realtime, word timestamps on")
+    broadcaster.publish({"type": "status", "text": "listening"})
+
+    # dense speech can outrun VAD commits; force one if 12 s pass without —
+    # otherwise lines (and Claude's view) lag arbitrarily far behind the room
+    last_commit = [time.monotonic()]
+
+    def sender():
+        while True:
+            block = audio_q.get()
+            force = time.monotonic() - last_commit[0] > 12
+            if force:
+                last_commit[0] = time.monotonic()
+            ws.send(json.dumps({"message_type": "input_audio_chunk",
+                                "audio_base_64": base64.b64encode(block).decode(),
+                                "sample_rate": 16000,
+                                **({"commit": True} if force else {})}))
+
+    threading.Thread(target=sender, name="scribe-rt-sender", daemon=True).start()
+
+    def emit(line: str, span: tuple[float, float]):
+        sid = transcript.append(f"[{time.strftime('%H:%M:%S')}] {line}", span)
+        print(f"[asr] {line}")
+        broadcaster.publish({"type": "transcript", "text": line, "id": sid,
+                             "ts": time.strftime("%H:%M:%S")})
+        session_log.log("transcript", text=line)
+
+    last_end_ms = None
+
+    def process(words: list[dict]):
+        nonlocal last_end_ms
+        gap_ms = words[0]["start"] * 1000 - last_end_ms if last_end_ms is not None else 0
+        if gap_ms > 2500:
+            emit(f"[silence {round(gap_ms / 1000)}s]",
+                 (last_end_ms, words[0]["start"] * 1000))
+        last_end_ms = words[-1]["end"] * 1000
+
+        def who_of(w) -> str:
+            a, b = w["start"] * 1000, w["end"] * 1000
+            if mic_map["names"]:
+                return mic_map["names"][channel_for_span(a, b)].lower()
+            return speaker_for_span(a, b) or "speaker"
+
+        lines: list[list] = []  # [who, tokens, a_ms, b_ms]
+        for w in words:
+            who = who_of(w)
+            if lines and lines[-1][0] == who:
+                lines[-1][1].append(w["text"])
+                lines[-1][3] = w["end"] * 1000
+            else:
+                lines.append([who, [w["text"]], w["start"] * 1000, w["end"] * 1000])
+        for who, tokens, a_ms, b_ms in lines:
+            emit(f"{who}: {' '.join(tokens)}", (a_ms, b_ms))
+
+    # voice-mode fusion lag: AAI finalizes turns ~seconds after Scribe commits,
+    # so hold each batch briefly before attributing; mic attribution is instant
+    delay = 0.0 if mic_map["names"] else args.fuse_delay
+    batches: queue.Queue = queue.Queue()
+
+    def emitter():
+        while True:
+            ready, words = batches.get()
+            wait = ready - time.monotonic()
+            if wait > 0:
+                time.sleep(wait)
+            process(words)
+
+    threading.Thread(target=emitter, name="scribe-rt-emitter", daemon=True).start()
+
+    seen_types: set[str] = set()
+    while True:
+        raw = ws.recv()
+        if not raw:   # server closed the socket (e.g. idle after stream end)
+            raise ConnectionError("scribe realtime: socket closed")
+        msg = json.loads(raw)
+        mt = msg.get("message_type")
+        if mt not in seen_types:   # one shape sample per type, for API drift
+            seen_types.add(mt)
+            print(f"[scribe-rt] first {mt!r}: {str(msg)[:220]}")
+        if mt and ("error" in mt or mt in ("rate_limited", "invalid_request",
+                                           "quota_exceeded")):
+            raise RuntimeError(f"scribe realtime: {msg}")
+        if mt == "committed_transcript_with_timestamps":
+            last_commit[0] = time.monotonic()
+            words = [w for w in msg.get("words", []) if w.get("type") == "word"]
+            if words:
+                batches.put((time.monotonic() + delay, words))
 
 
 # ---------------------------------------------------------------- revision lane
@@ -1153,6 +1315,12 @@ def make_app(args) -> FastAPI:
 
         audio_meta["speed"] = args.speed if args.wav else 1.0
 
+        # scribe fast lane in voice mode runs AAI in parallel as a pure
+        # speaker timeline — both need the audio, so tee it
+        diarize_q: queue.Queue | None = (
+            queue.Queue() if args.asr == "scribe" and not mic_map["names"]
+            and os.environ.get("ASSEMBLYAI_API_KEY") else None)
+
         def reader():
             for b in blocks:
                 if audio_meta["wall0"] is None:
@@ -1160,17 +1328,22 @@ def make_app(args) -> FastAPI:
                 with audio_lock:
                     audio_store.extend(b)   # retained for the revision lane
                 audio_q.put(b)
+                if diarize_q is not None:
+                    diarize_q.put(b)
             audio_meta["ended"] = True   # lets the revisor flush the tail
             print("[audio] stream ended")
 
         transcriber = {"deepgram": deepgram_transcriber_thread,
                        "assemblyai": assemblyai_transcriber_thread,
+                       "scribe": scribe_realtime_transcriber_thread,
                        }.get(args.asr, transcriber_thread)
         targets = {
             "audio": reader,
             "transcriber": lambda: transcriber(audio_q, args),
             "commentator": lambda: commentator_thread(args),
         }
+        if diarize_q is not None:
+            targets["diarizer"] = lambda: assemblyai_diarizer_thread(diarize_q, args)
         if args.revise:
             targets["revisor"] = lambda: scribe_revision_thread(args)
 
@@ -1196,16 +1369,19 @@ def make_app(args) -> FastAPI:
                       "rerun without --fast", flush=True)
                 broadcaster.publish({"type": "status",
                                      "text": "commentator crashed — see terminal"})
-            elif exc.thread.name == "transcriber" and args.asr in ("deepgram", "assemblyai") and (
+            elif exc.thread.name in ("transcriber", "diarizer") and args.asr in (
+                    "deepgram", "assemblyai", "scribe") and (
                     issubclass(exc.exc_type, (OSError, ConnectionError))
-                    or "WebSocket" in exc.exc_type.__name__):
-                print(f"[{args.asr}] connection lost — reconnecting in 5s", flush=True)
+                    or "WebSocket" in exc.exc_type.__name__) \
+                    and not audio_meta.get("ended"):
+                name = exc.thread.name
+                print(f"[{name}] connection lost — reconnecting in 5s", flush=True)
                 broadcaster.publish({"type": "status", "text": "reconnecting ASR…"})
 
                 def relaunch_asr():
                     time.sleep(5)
                     broadcaster.publish({"type": "status", "text": "live"})
-                    spawn("transcriber")
+                    spawn(name)
 
                 threading.Thread(target=relaunch_asr, name="asr-relauncher",
                                  daemon=True).start()
@@ -1401,10 +1577,15 @@ def main():
                         "when several mics are captured")
     p.add_argument("--mock", action="store_true", help="canned comments instead of the Claude API")
     p.add_argument("--asr", default="auto",
-                   choices=["auto", "whisper", "deepgram", "assemblyai"],
-                   help="auto = assemblyai streaming (universal-3-5-pro, best accuracy) "
-                        "when ASSEMBLYAI_API_KEY is set, else deepgram when "
-                        "DEEPGRAM_API_KEY is set, else local whisper")
+                   choices=["auto", "whisper", "deepgram", "assemblyai", "scribe"],
+                   help="auto = scribe realtime (ElevenLabs, best streaming WER; "
+                        "diarization from per-person mics, or from a parallel "
+                        "AssemblyAI speaker timeline in voice mode) when "
+                        "ELEVENLABS_API_KEY is set, else assemblyai, else deepgram, "
+                        "else local whisper")
+    p.add_argument("--fuse-delay", type=float, default=2.5,
+                   help="scribe voice mode: seconds to hold committed lines so the "
+                        "AssemblyAI speaker timeline can label them")
     p.add_argument("--whisper-model", default="distil-large-v3",
                    help="faster-whisper model; small.en is a lighter fallback")
     p.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
@@ -1443,21 +1624,23 @@ def main():
     args = p.parse_args()
 
     if args.asr == "auto":
-        args.asr = ("assemblyai" if os.environ.get("ASSEMBLYAI_API_KEY")
+        args.asr = ("scribe" if os.environ.get("ELEVENLABS_API_KEY")
+                    else "assemblyai" if os.environ.get("ASSEMBLYAI_API_KEY")
                     else "deepgram" if os.environ.get("DEEPGRAM_API_KEY")
                     else "whisper")
     default_keyterms = Path(__file__).parent / "keyterms.txt"
     if not args.keyterms and default_keyterms.exists():
         args.keyterms = str(default_keyterms)
     if args.revise == "on" and not (os.environ.get("ELEVENLABS_API_KEY")
-                                    and args.asr == "assemblyai"):
-        sys.exit("--revise on needs ELEVENLABS_API_KEY and --asr assemblyai "
+                                    and args.asr in ("assemblyai", "scribe")):
+        sys.exit("--revise on needs ELEVENLABS_API_KEY and --asr assemblyai|scribe "
                  "(revision aligns to the streaming lane's word timestamps)")
     args.revise = (args.revise == "on"
-                   or (args.revise == "auto" and args.asr == "assemblyai"
+                   or (args.revise == "auto" and args.asr in ("assemblyai", "scribe")
                        and bool(os.environ.get("ELEVENLABS_API_KEY"))))
     for backend, envvar in (("deepgram", "DEEPGRAM_API_KEY"),
-                            ("assemblyai", "ASSEMBLYAI_API_KEY")):
+                            ("assemblyai", "ASSEMBLYAI_API_KEY"),
+                            ("scribe", "ELEVENLABS_API_KEY")):
         if args.asr == backend and not os.environ.get(envvar):
             sys.exit(f"--asr {backend} needs {envvar} in the environment")
     ensure_cuda_libs()
@@ -1473,8 +1656,12 @@ def main():
     print(f"[app] display:  http://localhost:{args.port}  (project this)")
     print(f"[app] margin:   http://localhost:{args.port}/margin  (textbook + margin-notes view)")
     print(f"[app] phones:   {meta['url']}  (QR in the corner of the display)")
+    scribe_diar = ("per-person mics" if mic_map["names"]
+                   else "assemblyai timeline" if os.environ.get("ASSEMBLYAI_API_KEY")
+                   else "NONE until revision — set ASSEMBLYAI_API_KEY")
     asr_desc = {"deepgram": "deepgram nova-3 (streaming diarization)",
                 "assemblyai": "assemblyai universal-3-5-pro (streaming diarization)",
+                "scribe": f"elevenlabs scribe realtime (diarization: {scribe_diar})",
                 }.get(args.asr, f"whisper {args.whisper_model} on {args.device}")
     if not args.mic and not args.wav:
         # zero-config hardware: capture every plugged-in audio-interface mic

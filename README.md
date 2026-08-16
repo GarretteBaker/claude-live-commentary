@@ -47,14 +47,17 @@ uv run app.py --mock                  # no API key, canned comments
 ## ASR backends
 
 `--asr auto` (default) picks the best available backend by accuracy:
-**AssemblyAI Universal-3.5 Pro streaming** when `ASSEMBLYAI_API_KEY` is set
-(their current flagship — best-in-class streaming WER, live word-level
-speaker diarization up to 10 speakers, formatted turns), else **Deepgram
-nova-3 streaming** when `DEEPGRAM_API_KEY` is set (faster/cheaper, a WER
-tier below), else **local faster-whisper** (~7 s chunks on the GPU,
-ECAPA-embedding speaker clustering, private, no cloud). Force one with
-`--asr whisper|deepgram|assemblyai`. Cloud backends reconnect automatically
-on network blips.
+**ElevenLabs Scribe v2 Realtime** when `ELEVENLABS_API_KEY` is set (best
+streaming WER; no native diarization — speakers come from per-person mics
+when hooked up, else from a parallel **AssemblyAI speaker timeline** fused
+by word-timestamp overlap, with a `--fuse-delay` hold so labels arrive
+first), else **AssemblyAI Universal-3.5 Pro streaming** (integrated live
+diarization), else **Deepgram nova-3**, else **local faster-whisper** (~7 s
+GPU chunks, ECAPA clustering, private, no cloud). Force one with
+`--asr whisper|deepgram|assemblyai|scribe`. Cloud backends reconnect
+automatically on network blips. Scribe realtime keyterms are capped by the
+API at the file's first 50 terms of ≤20 chars (batch revision still gets up
+to 1000).
 
 The AssemblyAI path also takes `--keyterms names.txt` (one name/term per
 line, ≤100 used) — **keyterm prompting targets exactly the tokens Claude
