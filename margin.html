@@ -97,19 +97,6 @@
     color: var(--pencil); font-weight: 500; font-size: clamp(17px, 1.4vw, 22px);
   }
   .note.scribble.done { opacity: 0.4; font-size: clamp(11px, 0.85vw, 14px); }
-  /* unreadably small notes (margin congestion / resolved scribbles) grow
-     smoothly back to full size on hover: a single transform scale from the
-     top-right corner — no reflow, no jump — with paper fading in beneath */
-  .note.cramped, .note.scribble.done {
-    transform-origin: top right;
-    transition: top 0.45s ease, transform 0.18s ease,
-                background-color 0.18s ease, box-shadow 0.18s ease;
-  }
-  .note.cramped:hover, .note.scribble.done:hover {
-    transform: rotate(-0.15deg) scale(var(--unshrink, 1.6));
-    opacity: 1; z-index: 7; background-color: var(--paper);
-    box-shadow: 0 6px 22px rgba(60,50,30,0.14); border-radius: 3px;
-  }
   /* a question to the room: red pencil, leading ? */
   .note.ask { color: #a03d2e; }
   .note.ask::before { content: "?  "; font-weight: 700; }
@@ -506,8 +493,6 @@
         const shrink = Math.max(0.68, 1 - over / 1600);
         n.el.style.fontSize =
           `calc(clamp(22px, 2.0vw, 32px) * var(--note-scale, 1) * ${(shrink * reader).toFixed(3)})`;
-        n.el.classList.toggle("cramped", shrink < 0.85);
-        n.el.style.setProperty("--unshrink", (1 / shrink).toFixed(3));
       }
       y = Math.max(n.y, y) + n.el.offsetHeight + 14;
     }

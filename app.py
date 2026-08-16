@@ -1169,6 +1169,7 @@ def muse_agent_thread(args, request: str):
     """Background agent with Discord tools; report lands in Marginalia's next
     turn alongside web-search reports."""
     import anthropic
+    import httpx
     ds = _discord_module()
     client = anthropic.Anthropic(max_retries=4)
     system = MUSE_AGENT_SYSTEM.format(
@@ -1188,9 +1189,20 @@ def muse_agent_thread(args, request: str):
         for block in resp.content:
             if block.type == "tool_use":
                 print(f"[muse-agent] {block.name}({json.dumps(block.input)[:120]})")
-                out = getattr(ds, block.name)(**block.input)
+                # Discord API refusals (403 no-access, 404 gone) are data the
+                # agent should react to, not crashes — the ONE sanctioned
+                # narrow except in this codebase; anything else still raises
+                try:
+                    content = json.dumps(getattr(ds, block.name)(**block.input),
+                                         default=str)[:6000]
+                    is_err = False
+                except httpx.HTTPStatusError as e:
+                    content = (f"{e.response.status_code} "
+                               f"{e.response.reason_phrase} for {e.request.url}")
+                    is_err = True
+                    print(f"[muse-agent] tool refused: {content}")
                 results.append({"type": "tool_result", "tool_use_id": block.id,
-                                "content": json.dumps(out, default=str)[:6000]})
+                                "content": content, "is_error": is_err})
         msgs.append({"role": "user", "content": results})
     report = " ".join(b.text for b in resp.content if b.type == "text").strip()
     dt = round(time.monotonic() - t0, 1)
