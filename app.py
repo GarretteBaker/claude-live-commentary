@@ -1131,7 +1131,6 @@ def thread_agent_thread(args, tid: int):
     """A parallel Marginalia carries the endnote conversation: same system
     prompt, same full-transcript context (cache-shared with the main loop),
     plus the thread so far. Serialized so replies to one thread stay ordered."""
-    import anthropic
     t = threads[tid - 1]
     with thread_agent_lock:
         msgs = "\n".join(f"{m['who']}: {m['text']}" for m in t["messages"])
@@ -1143,14 +1142,7 @@ def thread_agent_thread(args, tid: int):
             "Reply with only your next message in this thread: conversational "
             "margin voice, at most 60 words, no quote line, never PASS. "
             "LaTeX renders.")})
-        client = anthropic.Anthropic(max_retries=4)
-        resp = client.beta.messages.create(
-            model=args.claude_model, max_tokens=1500,
-            betas=["server-side-fallback-2026-07-01"], fallbacks="default",
-            output_config={"effort": args.effort},
-            system=build_system_prompt(),
-            messages=[{"role": "user", "content": content}])
-        text = "".join(b.text for b in resp.content if b.type == "text").strip()
+        text = LLM(args).complete(build_system_prompt(), content, 1500)
     thread_post(t, "marginalia", text)
     print(f"[thread #{tid}] marginalia: {text}")
 
@@ -1267,7 +1259,7 @@ def muse_agent_thread(args, request: str):
     t0 = time.monotonic()
     for _hop in range(8):
         resp = client.beta.messages.create(
-            model=args.claude_model, max_tokens=1500,
+            model=args.anthropic_model, max_tokens=1500,
             betas=["server-side-fallback-2026-07-01"], fallbacks="default",
             output_config={"effort": "low"},
             system=system, tools=DISCORD_TOOLS, messages=msgs)
@@ -1390,7 +1382,7 @@ def recall_agent_thread(args, query: str):
     t0 = time.monotonic()
     for _hop in range(8):
         resp = client.beta.messages.create(
-            model=args.claude_model, max_tokens=1500,
+            model=args.anthropic_model, max_tokens=1500,
             betas=["server-side-fallback-2026-07-01"], fallbacks="default",
             output_config={"effort": "low"},
             system=RECALL_AGENT_SYSTEM, tools=RECALL_TOOLS, messages=msgs)
@@ -1478,14 +1470,16 @@ plain text. If the web doesn't settle it, say what you found and what remains \
 uncertain."""
 
 
-def search_agent_thread(client, args, query: str):
+def search_agent_thread(args, query: str):
     """Spawned on demand so the fast commentary loop never blocks on it."""
+    import anthropic
+    client = anthropic.Anthropic(max_retries=4)
     t0 = time.monotonic()
     messages = [{"role": "user", "content":
                  f"Query: {query}\n\nRecent discussion context:\n{transcript.text()[-2000:]}"}]
     for _hop in range(5):  # server-side tool loop can pause; resume it
         response = client.beta.messages.create(
-            model=args.claude_model,
+            model=args.anthropic_model,
             max_tokens=1500,
             betas=["server-side-fallback-2026-07-01"],
             fallbacks="default",
@@ -1549,52 +1543,116 @@ def dispatch_agent(kind: str, query: str, target) -> bool:
     return True
 
 
-def stream_claude(client, args, comment_id: int) -> tuple[str, float | None]:
+class LLM:
+    """The commentator model, swappable per the mix-and-match plan: native
+    Anthropic (full extras: server-side fallback, effort, fast mode, prompt
+    caching), any Anthropic-compatible endpoint (kimi/<model> = Moonshot, or
+    --model-base-url), or OpenAI chat completions (openai/<model>). Background
+    agents (web search, muse, recall) always stay on native Anthropic — they
+    need server-side tools."""
+
+    def __init__(self, args):
+        self.args = args
+        self.provider = args.provider
+        self.last_stop: str | None = None
+        if self.provider == "openai":
+            import openai
+            self.client = openai.OpenAI(api_key=os.environ[args.model_key_env])
+        else:
+            import anthropic
+            kw = {"max_retries": 4}
+            if self.provider == "anthropic_compat":
+                kw |= {"base_url": args.model_base_url,
+                       "api_key": os.environ[args.model_key_env]}
+            self.client = anthropic.Anthropic(**kw)
+
+    @staticmethod
+    def _flatten(content) -> str:
+        return ("".join(b["text"] for b in content)
+                if isinstance(content, list) else content)
+
+    @staticmethod
+    def _strip_cache(content):
+        return ([{k: v for k, v in b.items() if k != "cache_control"}
+                 for b in content] if isinstance(content, list) else content)
+
+    def stream(self, system: str, content, max_tokens: int):
+        """Yield text deltas; sets self.last_stop to 'end_turn' | 'max_tokens'
+        | 'refusal' when the generator finishes."""
+        a = self.args
+        self.last_stop = "end_turn"
+        if self.provider == "openai":
+            resp = self.client.chat.completions.create(
+                model=a.claude_model, max_completion_tokens=max_tokens,
+                stream=True,
+                messages=[{"role": "system", "content": system},
+                          {"role": "user", "content": self._flatten(content)}])
+            fin = None
+            for chunk in resp:
+                if chunk.choices:
+                    fin = chunk.choices[0].finish_reason or fin
+                    if chunk.choices[0].delta.content:
+                        yield chunk.choices[0].delta.content
+            self.last_stop = {"length": "max_tokens",
+                              "content_filter": "refusal"}.get(fin, "end_turn")
+            return
+        kwargs = dict(model=a.claude_model, max_tokens=max_tokens,
+                      system=system,
+                      messages=[{"role": "user", "content": content}])
+        if self.provider == "anthropic":
+            kwargs |= dict(betas=["server-side-fallback-2026-07-01"]
+                                 + (["fast-mode-2026-02-01"] if a.fast else []),
+                           fallbacks="default",
+                           output_config={"effort": a.effort})
+            if a.fast:  # ~2.5x output speed at 2x price; thinking tokens too
+                kwargs["speed"] = "fast"
+            mgr = self.client.beta.messages.stream(**kwargs)
+        else:
+            kwargs["messages"][0]["content"] = self._strip_cache(content)
+            mgr = self.client.messages.stream(**kwargs)
+        with mgr as stream:
+            for delta in stream.text_stream:
+                yield delta
+            self.last_stop = stream.get_final_message().stop_reason
+
+    def complete(self, system: str, content, max_tokens: int) -> str:
+        text = "".join(self.stream(system, content, max_tokens))
+        return text.strip()
+
+
+def stream_claude(llm: LLM, args, comment_id: int) -> tuple[str, float | None]:
     """Stream a reply, publishing deltas to the display as soon as it is
     clear the reply is a comment rather than a PASS.
     Returns (full text, seconds to first displayed words or None)."""
     t0 = time.monotonic()
     first = None
     shown = ""
-    kwargs = {}
-    if args.fast:  # ~2.5x output speed at 2x price; thinking tokens too, so
-        kwargs = {"speed": "fast"}  # it cuts time-to-first-words directly
-    with client.beta.messages.stream(
-        model=args.claude_model,
-        max_tokens=1500,  # thinking tokens count toward this; 500 truncated
-                          # long direct-address answers mid-word
-        betas=["server-side-fallback-2026-07-01"]
-              + (["fast-mode-2026-02-01"] if args.fast else []),
-        fallbacks="default",
-        output_config={"effort": args.effort},
-        system=build_system_prompt(),
-        messages=[{"role": "user", "content": build_user_content()}],
-        **kwargs,
-    ) as stream:
-        text = ""
-        for delta in stream.text_stream:
-            text += delta
-            clean = text.lstrip()
-            # withhold until we can rule out PASS, SEARCH and ASK — none of
-            # these stream to the screen (ASK lands whole via comment_done)
-            if (len(clean) < 7 or clean[:4].upper() == "PASS"
-                    or clean[:6].upper() == "SEARCH"
-                    or clean[:5].upper() == "REPLY"
-                    or clean[:4].upper() == "MUSE"
-                    or clean[:5].upper() == "ASK |" or clean[:4].upper() == "ASK|"):
-                continue
-            if first is None:
-                first = time.monotonic() - t0
-                broadcaster.publish({"type": "comment_start", "id": comment_id,
-                                     "ts": time.strftime("%H:%M:%S")})
-            if clean != shown:
-                shown = clean
-                broadcaster.publish({"type": "comment_delta", "id": comment_id,
-                                     "text": clean})
-        final = stream.get_final_message()
-    if final.stop_reason == "refusal":
+    text = ""
+    # max_tokens 1500: thinking tokens count toward it; 500 truncated long
+    # direct-address answers mid-word
+    for delta in llm.stream(build_system_prompt(), build_user_content(), 1500):
+        text += delta
+        clean = text.lstrip()
+        # withhold until we can rule out PASS, SEARCH and ASK — none of
+        # these stream to the screen (ASK lands whole via comment_done)
+        if (len(clean) < 7 or clean[:4].upper() == "PASS"
+                or clean[:6].upper() == "SEARCH"
+                or clean[:6].upper() == "RECALL"
+                or clean[:5].upper() == "REPLY"
+                or clean[:4].upper() == "MUSE"
+                or clean[:5].upper() == "ASK |" or clean[:4].upper() == "ASK|"):
+            continue
+        if first is None:
+            first = time.monotonic() - t0
+            broadcaster.publish({"type": "comment_start", "id": comment_id,
+                                 "ts": time.strftime("%H:%M:%S")})
+        if clean != shown:
+            shown = clean
+            broadcaster.publish({"type": "comment_delta", "id": comment_id,
+                                 "text": clean})
+    if llm.last_stop == "refusal":
         return "PASS", first
-    if final.stop_reason == "max_tokens":
+    if llm.last_stop == "max_tokens":
         print("[claude] reply hit max_tokens — truncated", flush=True)
         session_log.log("truncated", tail=text[-80:])
     return text.strip(), first
@@ -1623,11 +1681,7 @@ MOCK_COMMENTS = iter([
 
 
 def commentator_thread(args):
-    if args.mock:
-        client = None
-    else:
-        import anthropic
-        client = anthropic.Anthropic(max_retries=4)  # ride out short network blips
+    llm = None if args.mock else LLM(args)
 
     seen_words = 0
     last_fire = time.monotonic() - args.call_gap  # allow an early first call
@@ -1663,7 +1717,7 @@ def commentator_thread(args):
         if args.mock:
             reply, ttfw = stream_mock(comment_id)
         else:
-            reply, ttfw = stream_claude(client, args, comment_id)
+            reply, ttfw = stream_claude(llm, args, comment_id)
         dt = time.monotonic() - t0
         broadcaster.publish({"type": "stage", "text": "listening"})
 
@@ -1698,7 +1752,7 @@ def commentator_thread(args):
         if reply.strip().upper().startswith("SEARCH"):
             query = reply.split("|", 1)[1].strip() if "|" in reply else reply.strip()[6:].strip()
             if dispatch_agent("web", query,
-                              lambda: search_agent_thread(client, args, query)):
+                              lambda: search_agent_thread(args, query)):
                 print(f"[claude] spawning search agent: {query!r}")
                 broadcaster.publish({"type": "search_spawn", "text": query,
                                      "ts": time.strftime("%H:%M:%S")})
@@ -1813,6 +1867,10 @@ def make_app(args) -> FastAPI:
             import anthropic
             transient = (anthropic.APIConnectionError, anthropic.RateLimitError,
                          anthropic.InternalServerError)
+            if args.provider == "openai":
+                import openai
+                transient += (openai.APIConnectionError, openai.RateLimitError,
+                              openai.InternalServerError)
             # a 429 saying "0 fast mode tokens" means the org has no fast-mode
             # allocation at all — permanent, don't relaunch into a crash loop
             if "0 fast mode" in str(exc.exc_value):
@@ -2046,7 +2104,21 @@ def main():
     p.add_argument("--no-speakers", action="store_true",
                    help="disable speaker labeling (skips the ECAPA model)")
     p.add_argument("--chunk-sec", type=float, default=7.0, help="transcription chunk length")
-    p.add_argument("--claude-model", default="claude-opus-5")
+    p.add_argument("--claude-model", "--model", dest="claude_model",
+                   default="claude-opus-5",
+                   help="commentator model. Prefix to swap providers: "
+                        "kimi/<model> = Moonshot's Anthropic-compatible endpoint "
+                        "(MOONSHOT_API_KEY), openai/<model> = OpenAI chat "
+                        "completions (OPENAI_API_KEY). Background agents (search/"
+                        "muse/recall) always run on Anthropic (server-side tools)")
+    p.add_argument("--model-base-url", metavar="URL",
+                   help="route the commentator to any Anthropic-compatible "
+                        "endpoint (LiteLLM proxy, DeepSeek, GLM, ...); pair with "
+                        "--model-key-env")
+    p.add_argument("--model-key-env", metavar="ENVVAR",
+                   help="env var holding the API key for --model-base-url / a "
+                        "provider prefix (defaults: MOONSHOT_API_KEY for kimi/, "
+                        "OPENAI_API_KEY for openai/, ANTHROPIC_API_KEY otherwise)")
     p.add_argument("--effort", default="medium", choices=["low", "medium", "high"],
                    help="Claude reasoning effort; low is the main latency lever")
     p.add_argument("--fast", action="store_true",
@@ -2086,6 +2158,33 @@ def main():
     args = p.parse_args()
     args.save_audio = (args.save_audio == "on"
                        or (args.save_audio == "auto" and not args.wav))
+
+    # provider routing for the commentator model (mix-and-match lane)
+    args.provider = "anthropic"
+    if args.claude_model.startswith(("kimi/", "moonshot/")):
+        args.claude_model = args.claude_model.split("/", 1)[1]
+        args.provider = "anthropic_compat"
+        args.model_base_url = args.model_base_url or "https://api.moonshot.ai/anthropic"
+        args.model_key_env = args.model_key_env or "MOONSHOT_API_KEY"
+    elif args.claude_model.startswith("openai/"):
+        args.claude_model = args.claude_model.split("/", 1)[1]
+        args.provider = "openai"
+        args.model_key_env = args.model_key_env or "OPENAI_API_KEY"
+    elif args.model_base_url:
+        args.provider = "anthropic_compat"
+        args.model_key_env = args.model_key_env or "ANTHROPIC_API_KEY"
+    if args.provider != "anthropic":
+        if not os.environ.get(args.model_key_env):
+            sys.exit(f"model provider needs {args.model_key_env} in the environment")
+        if not os.environ.get("ANTHROPIC_API_KEY") and not args.mock:
+            print("[app] WARNING: no ANTHROPIC_API_KEY — background agents "
+                  "(SEARCH/MUSE/RECALL) will crash if dispatched", flush=True)
+        if args.fast:
+            print("[app] --fast is Anthropic-only; ignored", flush=True)
+            args.fast = False
+    # background agents stay on native Anthropic (server-side tools)
+    args.anthropic_model = (args.claude_model if args.provider == "anthropic"
+                            else "claude-opus-5")
 
     if args.asr == "auto":
         args.asr = ("scribe" if os.environ.get("ELEVENLABS_API_KEY")
@@ -2154,6 +2253,9 @@ def main():
             owner = f" -> {mic_map['names'][i]}" if mic_map["names"] else ""
             print(f"[app]   mic:    {m}{owner}")
     print(f"[app] asr:      {asr_desc}")
+    print(f"[app] model:    {args.claude_model}"
+          + (f" via {args.provider} ({args.model_base_url or 'api.openai.com'})"
+             if args.provider != "anthropic" else ""))
     print(f"[app] revise:   " + (f"scribe_v2 every {args.revise_sec:.0f}s "
                                  "(settled UPPERCASE letters, [laughter] tags)"
                                  if args.revise else "off (provisional ASR only)"))
