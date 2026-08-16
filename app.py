@@ -233,6 +233,13 @@ class Transcript:
         with self._lock:
             return self._stable if self.revision_active else len(self._segments)
 
+    def stable_end_ms(self) -> float:
+        """Audio position the revision lane has settled up to — lets a
+        relaunched revisor resume instead of re-revising from zero."""
+        with self._lock:
+            ends = [sp[1] for sp in self._spans[:self._stable] if sp is not None]
+            return max(ends) if ends else 0.0
+
     def text(self) -> str:
         with self._lock:
             return "\n".join(self._segments)
@@ -653,7 +660,9 @@ def scribe_revision_thread(args):
     print(f"[scribe] revision lane on: scribe_v2 every {args.revise_sec:.0f}s"
           + (f", {len(terms)} keyterms" if terms else ""))
 
-    revised_until = 0.0  # ms of audio already settled
+    revised_until = transcript.stable_end_ms()  # resume point after a relaunch
+    if revised_until:
+        print(f"[scribe] resuming from {revised_until / 1000:.0f}s")
 
     def pcm_slice(a_ms: float, b_ms: float) -> bytes:
         with audio_lock:
@@ -1200,19 +1209,20 @@ def make_app(args) -> FastAPI:
 
                 threading.Thread(target=relaunch_asr, name="asr-relauncher",
                                  daemon=True).start()
-            elif exc.thread.name == "revisor" and issubclass(
-                    exc.exc_type, (OSError, ConnectionError)) or (
-                    exc.thread.name == "revisor"
-                    and "httpx" in exc.exc_type.__module__
-                    and "Transport" in exc.exc_type.__name__):
-                print("[scribe] revision call failed — retrying in 10s", flush=True)
+            elif exc.thread.name == "revisor":
+                import httpx
+                # TransportError covers ConnectError (DNS), timeouts, resets —
+                # everything transient; HTTP 4xx (bad key etc.) stays dead
+                if issubclass(exc.exc_type,
+                              (OSError, ConnectionError, httpx.TransportError)):
+                    print("[scribe] revision call failed — retrying in 10s", flush=True)
 
-                def relaunch_revisor():
-                    time.sleep(10)
-                    spawn("revisor")
+                    def relaunch_revisor():
+                        time.sleep(10)
+                        spawn("revisor")
 
-                threading.Thread(target=relaunch_revisor, name="revisor-relauncher",
-                                 daemon=True).start()
+                    threading.Thread(target=relaunch_revisor,
+                                     name="revisor-relauncher", daemon=True).start()
             elif exc.thread.name == "commentator" and issubclass(exc.exc_type, transient):
                 print("[commentator] transient failure — restarting in 15s", flush=True)
                 broadcaster.publish({"type": "status", "text": "reconnecting to Claude…"})
