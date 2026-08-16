@@ -69,6 +69,8 @@ You always see the full session transcript. If the room explicitly asks you to s
 
 People in the room can write their own margin notes on the page (shown to you as "Reader margin notes" with ids like m2). To respond to one, reply "REPLY m2 | <your response, at most 40 words>" — this opens a side-conversation ("aside") attached to their note. Respond when you can add something real (an answer, a correction, a sharpened version of their point); stay silent otherwise. Readers can also open asides on YOUR notes; a parallel copy of you carries those conversations, and recent thread messages appear in your context — never use REPLY on a thread that already has messages.
 
+You also have a back-office agent connected to Iliad's Discord (it can search and read every channel; posting is only physically possible into the #claude channel). When the room explicitly asks you to check the discord, look something up there, or post something ("Marginalia, post that to discord"), reply "MUSE | <request>" — the agent's report appears in your next turn among the agent reports. Only use it when the room asks, and never request a post unless the room explicitly asked for one.
+
 You may also reply "ASK | <question, at most 15 words>": it is projected to the room as a question from you, and someone may answer aloud (the answer reaches you through the transcript). Use your judgement about when — the best questions are high-entropy: you are genuinely uncertain of the answer, and the answer would change what you write next. A garbled key term, an ambiguous referent, suspected mis-attribution, a fork in the argument you can't resolve — all fair game. Don't ask what context already determines.
 
 Most turns should be PASS. When you decline, reply "PASS | <ten-word reason>" so the operator can tune the system; the reason is never projected. Otherwise output only the note text (with its quote line) — no preamble or markdown. LaTeX math with $...$ or $$...$$ delimiters renders on the page; use it for formulas."""
@@ -1017,8 +1019,8 @@ def build_user_content() -> list[dict]:
     blocks.append({"type": "text",
                    "text": (f"\nYour previous comments:\n{prev}\n\n{reader_block}"
                             f"{threads_block}{reports_block}{pressure}"
-                            f"Reply with PASS, SEARCH | <query>, ASK | <question>, "
-                            f"REPLY m<id> | <response>, or one note.")})
+                            f"Reply with PASS, SEARCH | <query>, MUSE | <request>, "
+                            f"ASK | <question>, REPLY m<id> | <response>, or one note.")})
     return blocks
 
 
@@ -1100,6 +1102,106 @@ def thread_agent_thread(args, tid: int):
     print(f"[thread #{tid}] marginalia: {text}")
 
 
+# ------------------------------------------------------------- muse agent
+
+MUSE_AGENT_SYSTEM = """\
+You are Marginalia's back-office agent for the Iliad Discord, handling one request from the seminar room.
+Tools: full-text search over the synced message archive (usually fresh enough — search FIRST; a full sync takes minutes, so sync at most a couple of specific channels), reading channels/threads, and posting — which the infrastructure only permits into the #claude channel (id {write_channel}).
+POST ONLY IF THE REQUEST EXPLICITLY ASKS FOR A POST. Looking things up never justifies posting.
+Your final message becomes a short report injected into the live commentator's context: at most 120 words, just the findings (or the exact content you posted and where). No preamble."""
+
+DISCORD_TOOLS = [
+    {"name": "sync_messages", "description": "Sync new Discord messages into the local search index. SLOW when unscoped (minutes across all channels) — search the existing index FIRST, and sync only specific channel_ids when you truly need messages from the last hours.",
+     "input_schema": {"type": "object", "properties": {
+         "channel_ids": {"type": "array", "items": {"type": "string"}}}}},
+    {"name": "search_messages", "description": "Full-text search (FTS5: \"exact phrase\", AND/OR/NOT, prefix*) over the synced archive, newest first.",
+     "input_schema": {"type": "object", "properties": {
+         "query": {"type": "string"}, "channel": {"type": "string"},
+         "author": {"type": "string"}, "limit": {"type": "integer"}},
+         "required": ["query"]}},
+    {"name": "read_messages", "description": "Read recent messages from a channel or thread id, newest first.",
+     "input_schema": {"type": "object", "properties": {
+         "channel_id": {"type": "string"}, "limit": {"type": "integer"},
+         "before": {"type": "string"}}, "required": ["channel_id"]}},
+    {"name": "list_servers", "description": "List Discord servers the bot can see.",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "list_channels", "description": "List channels in a server.",
+     "input_schema": {"type": "object", "properties": {
+         "server_id": {"type": "string"}}, "required": ["server_id"]}},
+    {"name": "list_threads", "description": "List active threads under a channel.",
+     "input_schema": {"type": "object", "properties": {
+         "channel_id": {"type": "string"}}, "required": ["channel_id"]}},
+    {"name": "send_message", "description": "Post to a channel (infrastructure allows only the #claude channel and its threads). Use ONLY when the room explicitly asked for a post.",
+     "input_schema": {"type": "object", "properties": {
+         "channel_id": {"type": "string"}, "content": {"type": "string"},
+         "reply_to_message_id": {"type": "string"}},
+         "required": ["channel_id", "content"]}},
+]
+
+
+def _discord_module():
+    """Import ~/discord-mcp/server.py directly, feeding it the env that the
+    MCP registration stores in ~/.claude.json. Its `mcp` SDK import is only
+    used to *serve* the tools; shim it so we can call the functions in-process
+    without depending on the MCP package."""
+    import types
+    cfg = json.load(open(Path.home() / ".claude.json"))
+    for k, v in cfg["mcpServers"]["discord"]["env"].items():
+        os.environ.setdefault(k, v)
+    if "mcp" not in sys.modules:
+        class _ShimServer:
+            def __init__(self, *a, **k): pass
+            def tool(self, *a, **k):
+                return lambda fn: fn
+            def run(self, *a, **k): pass
+        shim = types.ModuleType("mcp")
+        shim_server = types.ModuleType("mcp.server")
+        shim_server.MCPServer = _ShimServer
+        shim.server = shim_server
+        sys.modules["mcp"] = shim
+        sys.modules["mcp.server"] = shim_server
+    sys.path.insert(0, str(Path.home() / "discord-mcp"))
+    import server as discord_server
+    return discord_server
+
+
+def muse_agent_thread(args, request: str):
+    """Background agent with Discord tools; report lands in Marginalia's next
+    turn alongside web-search reports."""
+    import anthropic
+    ds = _discord_module()
+    client = anthropic.Anthropic(max_retries=4)
+    system = MUSE_AGENT_SYSTEM.format(
+        write_channel=os.environ.get("WRITE_CHANNEL_IDS", "?"))
+    msgs = [{"role": "user", "content": f"Request from the seminar room: {request}"}]
+    t0 = time.monotonic()
+    for _hop in range(8):
+        resp = client.beta.messages.create(
+            model=args.claude_model, max_tokens=1500,
+            betas=["server-side-fallback-2026-07-01"], fallbacks="default",
+            output_config={"effort": "low"},
+            system=system, tools=DISCORD_TOOLS, messages=msgs)
+        if resp.stop_reason != "tool_use":
+            break
+        msgs.append({"role": "assistant", "content": resp.content})
+        results = []
+        for block in resp.content:
+            if block.type == "tool_use":
+                print(f"[muse-agent] {block.name}({json.dumps(block.input)[:120]})")
+                out = getattr(ds, block.name)(**block.input)
+                results.append({"type": "tool_result", "tool_use_id": block.id,
+                                "content": json.dumps(out, default=str)[:6000]})
+        msgs.append({"role": "user", "content": results})
+    report = " ".join(b.text for b in resp.content if b.type == "text").strip()
+    dt = round(time.monotonic() - t0, 1)
+    search_reports.append({"ts": time.strftime("%H:%M:%S"),
+                           "query": f"[discord] {request}", "report": report})
+    broadcaster.publish({"type": "search_done", "query": f"[discord] {request}",
+                         "ts": time.strftime("%H:%M:%S"), "dt": dt})
+    session_log.log("muse_agent", request=request, report=report, dt=dt)
+    print(f"[muse-agent] done ({dt}s): {report[:160]}")
+
+
 SEARCH_AGENT_SYSTEM = """\
 You are the web-search agent for a live-lecture commentary system. You get one \
 query from the live commentator plus a little discussion context. Search the \
@@ -1171,6 +1273,7 @@ def stream_claude(client, args, comment_id: int) -> tuple[str, float | None]:
             if (len(clean) < 7 or clean[:4].upper() == "PASS"
                     or clean[:6].upper() == "SEARCH"
                     or clean[:5].upper() == "REPLY"
+                    or clean[:4].upper() == "MUSE"
                     or clean[:5].upper() == "ASK |" or clean[:4].upper() == "ASK|"):
                 continue
             if first is None:
@@ -1256,6 +1359,15 @@ def commentator_thread(args):
 
         timing = (f"{ttfw:.1f}s to first words, " if ttfw is not None else "") + f"{dt:.1f}s total"
         print(f"[claude] ({timing}) {reply}")
+        if re.match(r"MUSE\s*\|", reply.strip(), re.IGNORECASE):
+            request = reply.split("|", 1)[1].strip()
+            print(f"[claude] spawning discord agent: {request!r}")
+            broadcaster.publish({"type": "search_spawn",
+                                 "text": "[discord] " + request,
+                                 "ts": time.strftime("%H:%M:%S")})
+            threading.Thread(target=lambda: muse_agent_thread(args, request),
+                             name="muse-agent", daemon=True).start()
+            continue
         if reply.strip().upper().startswith("SEARCH"):
             query = reply.split("|", 1)[1].strip() if "|" in reply else reply.strip()[6:].strip()
             print(f"[claude] spawning search agent: {query!r}")
@@ -1653,6 +1765,11 @@ def main():
     if args.context:
         config["context"] = Path(args.context).read_text()[:8000]
         print(f"[app] context:  {args.context} ({len(config['context'])} chars)")
+    iliad_ctx = Path(__file__).parent / "iliad-context.md"
+    if iliad_ctx.exists():
+        config["context"] = (config["context"] + "\n\n"
+                             + iliad_ctx.read_text()[:6000]).strip()
+        print("[app] context:  + iliad-context.md")
 
     session_log.start(args)
     meta["url"] = f"http://{lan_ip()}:{args.port}"
