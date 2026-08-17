@@ -343,15 +343,23 @@
       layout();
       return;
     }
-    const m = ev.text.match(/^([A-Za-z]+\d*(?:-\d+)?): (.*)$/s);
+    const m = ev.text.match(/^([A-Za-z]+\d*(?:~\d+%)?(?:-\d+)?): (.*)$/s);
     const who = m ? m[1] : paraWho;
     const prov = !!(who && /[a-z]/.test(who));   // lowercase = provisional
     const body = m ? m[2] : ev.text;
-    if (!para || who !== paraWho || paraWords > 90) {
+    // speculative diarization is noisy (phantom speakers, spurious switches),
+    // so the room sees provisional text unlabeled, flowing in one paragraph;
+    // attribution appears when the revision lane settles the words. The
+    // commentator still receives the speculative labels in its prompt.
+    // ?speclabels restores the old behavior for debugging.
+    const showSpec = new URLSearchParams(location.search).has("speclabels");
+    const hideLabel = prov && !showSpec;
+    const key = hideLabel ? "(prov)" : who;
+    if (!para || key !== paraWho || paraWords > 90) {
       catchUpToNotes(lid);
       para = document.createElement("p");
       para.className = "para";
-      if (who) {
+      if (who && !hideLabel) {
         const label = document.createElement("span");
         label.className = "label" + (prov ? " prov" : "");
         label.dataset.line = lid;
@@ -360,7 +368,7 @@
         para.append(label);
       }
       textEl.append(para);
-      paraWho = who; paraWords = 0;
+      paraWho = key; paraWords = 0;
     }
     for (const raw of body.split(/\s+/)) {
       if (!raw) continue;
